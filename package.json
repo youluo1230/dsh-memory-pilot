@@ -1,0 +1,61 @@
+{
+  "name": "dsh-memory-pilot",
+  "version": "0.3.8",
+  "private": true,
+  "type": "module",
+  "description": "Decision-driven memory orchestration for DeepSeek Harness",
+  "main": "./src/plugin.mjs",
+  "exports": {
+    ".": "./src/plugin.mjs",
+    "./adapters": "./src/adapters.mjs",
+    "./host": "./src/host.mjs",
+    "./plugin": "./src/plugin.mjs",
+    "./registry": "./src/registry.mjs",
+    "./memos-http": "./src/memos-http.mjs",
+    "./memos-bridge": "./src/memos-bridge.mjs",
+    "./settings-rpc": "./src/settings-rpc.mjs",
+    "./configuration": "./src/configuration.mjs",
+    "./discovery": "./src/discovery.mjs",
+    "./tools": "./src/tools.mjs",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "examples"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check src/core.mjs && node --check src/adapters.mjs && node --check src/host.mjs && node --check src/plugin.mjs && node --check src/registry.mjs && node --check src/memos-http.mjs && node --check src/memos-bridge.mjs && node --check src/settings-rpc.mjs && node --check src/discovery.mjs && node --check src/configuration.mjs && node --check src/tools.mjs && node --check lib/client.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-llm": ">=0.2.0-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-tools": ">=0.2.0-rc.2 <0.3.0",
+    "@deepseek-ai/schemastery": "^3.18.4"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-trajectory"
+      ],
+      "platform": "web"
+    }
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh-tools": "0.2.0-rc.2"
+  }
+}
