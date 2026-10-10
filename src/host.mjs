@@ -51,6 +51,9 @@ export function attachHost(ctx, { orchestrator, orchestratorFor = () => orchestr
     let admitted = false;
     const off = agent.ctx.on('agent/pre-step', async (payload, next) => {
       if (payload.step !== 1) return next();
+      // The admission decision itself is synchronous with respect to this
+      // handler's await points: a user message in the triggering batch admits
+      // the session and no later batch can race the flag within one step.
       if (!admitted) {
         const result = await preStep(payload, next);
         if (payload.messages?.some(message => message.source?.kind === 'user')) admitted = true;

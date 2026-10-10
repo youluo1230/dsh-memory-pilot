@@ -127,9 +127,13 @@ export function apply(ctx, config) {
     return Boolean(workspaceFor(session.header.cwd, resolved));
   };
   const disposeTools = registerMemoryTools(ctx, { runtimeFor, identityFor, acceptsSession,
-    retrieveBudgetMs: 60000, rememberBudgetMs: current().captureBudgetMs ?? 60000 });
+    // Tool-driven retrieval bypasses the message-path decision gate, so it gets
+    // the capture budget rather than the interactive decision budget.
+    retrieveBudgetMs: current().captureBudgetMs ?? 60000, rememberBudgetMs: current().captureBudgetMs ?? 60000 });
   const host = attachHost(ctx, {
     orchestratorFor: session => runtimeFor(session)?.orchestrator,
+    // Deliberately floored at 60s: the interactive path spends its budget on the
+    // decision model plus one round of reads; a tighter value starves the reads.
     retrievalBudgetMs: () => Math.max(current().budgetMs ?? 9000, 60000),
     capture: () => (prepared().backends ?? []).some(binding => binding.scope === 'global' && binding.write === true),
     captureTurn: turn => runtimeFor(turn.session)?.registry.captureTurn(turn),
