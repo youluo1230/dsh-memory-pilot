@@ -25,9 +25,10 @@ function validOps(ops) {
     && ALLOWED_FIELDS.has(op.path[0]));
 }
 
-export function createSettingsRpcHandler(settings, { discover, createBank } = {}) {
+export function createSettingsRpcHandler(settings, { discover, createBank, testConnection } = {}) {
   const safeDiscover = typeof discover === 'function' ? discover : async () => ({ workspacePath: '', repositories: [], banks: [] });
   const safeCreateBank = typeof createBank === 'function' ? createBank : async () => { throw new Error('Bank creation unavailable'); };
+  const safeTestConnection = typeof testConnection === 'function' ? testConnection : async () => { throw new Error('Connection testing unavailable'); };
   return async (endpoint, payload = {}, signal) => {
     if (signal?.aborted) return fail('cancelled', 'Request was cancelled');
     if (endpoint === 'get') {
@@ -62,6 +63,18 @@ export function createSettingsRpcHandler(settings, { discover, createBank } = {}
         return { ok: true, value: await safeDiscover({ signal }) };
       } catch {
         return fail('create-bank-failed', 'Hindsight bank creation failed');
+      }
+    }
+    if (endpoint === 'test') {
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)
+        || Object.keys(payload).some(key => !['kind', 'config'].includes(key))
+        || (payload.kind !== 'decision' && payload.kind !== 'system')
+        || !payload.config || typeof payload.config !== 'object' || Array.isArray(payload.config)) {
+        return fail('bad-request', 'Invalid MemoryPilot connection test request');
+      }
+      try { return { ok: true, value: await safeTestConnection(payload, { signal }) }; }
+      catch (error) {
+        return fail('test-failed', error instanceof Error && error.message ? error.message : 'MemoryPilot connection test failed');
       }
     }
     if (endpoint !== 'mutate') return fail('bad-request', 'Unknown MemoryPilot settings operation');
