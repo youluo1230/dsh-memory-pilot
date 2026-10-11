@@ -47,3 +47,23 @@ A slower, deeper synthesis over memory intended for questions that require histo
 ## Turn capture
 
 The asynchronous recording of one completed user-to-assistant turn, including eligible tool activity, into global shared memory. Turn capture records the conversation stream; it is not a model-selected durable fact write and does not imply that repository memory must also be updated.
+
+## Resident memory
+
+A small, bounded memory snapshot loaded at the beginning of a session and kept unchanged for that session. Resident memory contains a global user profile, global facts, and repository facts. It is data rather than instruction and is distinct from dynamically retrieved external memory.
+
+## Soul
+
+A user-authored, profile-wide description of the agent's identity, tone, and persona. Soul is instruction, not memory. It is never an automatic retention target and has no repository-specific variant.
+
+## User profile
+
+Cross-project resident memory about the user's stable identity, preferences, communication style, and working habits. It does not contain repository rules or detailed historical events.
+
+## Resident fact
+
+A concise fact that must remain visible without retrieval. A resident fact may be global or repository-scoped. Detailed history and experience belong in an external memory system.
+
+## Managed memory entry
+
+A resident-memory entry maintained by MemoryPilot inside an explicitly marked section of a user-editable file. Automated retention may add or replace a managed entry but never rewrites human-authored text outside that section.

@@ -1,5 +1,6 @@
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import Schema from '@deepseek-ai/schemastery';
+import { resolve } from 'node:path';
 import { createOrchestrator } from './core.mjs';
 import { acceptsWorkspacePath, bindingsForIdentity, detectIdentity, matchWorkspace } from './configuration.mjs';
 import { createOpenAICompatibleDecision, createSystemOneDecision } from './adapters.mjs';
@@ -8,6 +9,8 @@ import { attachHost } from './host.mjs';
 import { installSettingsRpc } from './settings-rpc.mjs';
 import { testDecisionConnection, testSystemConnection } from './connection-test.mjs';
 import { registerMemoryTools } from './tools.mjs';
+import { createResidentMemory } from './resident-memory.mjs';
+import { createRetentionRouter } from './retention-router.mjs';
 
 const debug = line => { if (process.env.MEMORY_PILOT_DEBUG) console.error(`[memory-pilot] ${line}`); };
 debug('module evaluated');
@@ -24,7 +27,7 @@ function resolveConfig(config) {
 }
 
 export const name = 'dsh-memory-pilot';
-export const inject = ['connection', 'webServer', 'settings', 'workspaceRegistry', 'tools'];
+export const inject = ['connection', 'webServer', 'settings', 'workspaceRegistry', 'tools', 'systemPrompt'];
 // Every editable field is volatile: the settings UI commits edits in place and
 // the Loader hands live references instead of remounting the plugin. The
 // settings describe mirror only serves entries that own at least one volatile
@@ -61,6 +64,9 @@ export const Config = Schema.object({
 export function apply(ctx, config) {
   debug('apply called');
   const current = () => resolveConfig(config);
+  const residentMemory = createResidentMemory();
+  const residentSnapshots = new WeakMap();
+  const residentLoads = new WeakMap();
   let configHash = '';
   const runtimes = new Map();
   const disposeRuntimes = entries => void Promise.allSettled(entries.flatMap(runtime =>
@@ -84,6 +90,22 @@ export function apply(ctx, config) {
       ? { id: resolved.workspaceId || resolved.workspacePath, path: resolved.workspacePath }
       : undefined;
   };
+  const resolveProjectRef = reference => {
+    if (typeof reference !== 'string') throw new Error('Unknown resident memory project');
+    const split = reference.indexOf('::');
+    if (split >= 0 && typeof ctx.workspaceRegistry?.list === 'function') {
+      const workspaceId = reference.slice(0, split), relativePath = reference.slice(split + 2);
+      const workspace = ctx.workspaceRegistry.list().find(row => String(row.id) === workspaceId);
+      if (!workspace || relativePath.split(/[\\/]/).some(part => part === '..')) throw new Error('Unknown resident memory project');
+      const candidate = resolve(workspace.path, relativePath);
+      if (!acceptsWorkspacePath(workspace.path, candidate)) throw new Error('Unknown resident memory project');
+      return candidate;
+    }
+    const resolved = prepared();
+    const workspace = workspaceFor(reference, resolved);
+    if (!workspace) throw new Error('Unknown resident memory project');
+    return reference;
+  };
   const identityFor = session => {
     const resolved = prepared();
     const workspace = workspaceFor(session.header?.cwd, resolved);
@@ -98,21 +120,31 @@ export function apply(ctx, config) {
     const resolved = prepared();
     if (!resolved.enabled || !resolved.decisionBaseUrl || !resolved.decisionModel) return null;
     const identity = identityFor(session);
-    const key = JSON.stringify([identity.actorId, identity.projectId, identity.workspaceId, identity.workspacePath]);
+    const key = JSON.stringify([identity.actorId, identity.projectKey, identity.projectId, identity.workspaceId, identity.workspacePath]);
     if (runtimes.has(key)) return runtimes.get(key);
     const bindings = bindingsForIdentity(resolved, identity);
-    if (!bindings.length) return null;
-    const registry = createRegistry({ bindings, identities: { personal: identity.actorId, project: identity.projectId, workspace: identity.workspaceId } });
+    const registry = bindings.length ? createRegistry({ bindings, identities: { personal: identity.actorId, project: identity.projectId, workspace: identity.workspaceId } }) : null;
     const createDecision = resolved.decisionProtocol === 'openai' ? createOpenAICompatibleDecision : createSystemOneDecision;
     const apiKey = resolved.decisionKeyEnv ? process.env[resolved.decisionKeyEnv] : undefined;
-    const orchestrator = createOrchestrator({
-      decision: createDecision({ baseUrl: resolved.decisionBaseUrl, model: resolved.decisionModel, apiKey }),
-      backends: registry.backends, policy: registry.policy, budgetMs: resolved.budgetMs,
+    const decision = createDecision({ baseUrl: resolved.decisionBaseUrl, model: resolved.decisionModel, apiKey });
+    const orchestrator = registry ? createOrchestrator({
+      decision, backends: registry.backends, policy: registry.policy, budgetMs: resolved.budgetMs,
       onAudit: record => ctx.logger.info(`MemoryPilot ${JSON.stringify(record)}`),
-    });
-    const runtime = { registry, orchestrator };
+    }) : null;
+    const writable = Object.entries(registry?.backends ?? {}).filter(([,backend]) => backend.capabilities.includes('write'));
+    const externalRetain = writable.length === 1 ? async (event, { signal } = {}) => {
+      const [backendId,backend] = writable[0];
+      const binding=bindings.find(row=>row.id===backendId);
+      await backend.execute({operation:'write',backend:backendId,scope:binding.scope,scopeId:binding.scopeId,content:event.text,evidence:{eventId:event.id,quote:event.text}},{signal});
+      return {status:'ok',accepted:1};
+    } : undefined;
+    const retentionRouter = typeof decision.decideRetention === 'function'
+      ? createRetentionRouter({ decision, residentMemory, externalRetain,
+        externalAvailable: () => writable.length === 1,
+        onAudit: record => ctx.logger.info(`MemoryPilot ${JSON.stringify(record)}`) }) : undefined;
+    const runtime = { registry, orchestrator, retentionRouter };
     runtimes.set(key, runtime);
-    debug(`orchestrator built for ${identity.projectId}:${identity.workspaceId}`);
+    debug(`memory runtime built for ${identity.projectId}:${identity.workspaceId}`);
     return runtime;
   };
   const initial = prepared();
@@ -123,6 +155,9 @@ export function apply(ctx, config) {
   }
   const disposeSettingsRpc = installSettingsRpc(ctx, {
     getConfig: current,
+    residentMemory,
+    resolveIdentity: reference => identityFor({ header: { cwd: resolveProjectRef(reference) } }),
+    onAudit: record => ctx.logger.info(`MemoryPilot ${JSON.stringify(record)}`),
     // One-shot probes for the settings UI "测试" buttons. They receive the
     // DRAFT (possibly unsaved) config and must not touch runtimes or state.
     testConnection: async ({ kind, config }, { signal } = {}) => {
@@ -135,21 +170,52 @@ export function apply(ctx, config) {
     if (resolved.enabled !== true || typeof session.header?.cwd !== 'string') return false;
     return Boolean(workspaceFor(session.header.cwd, resolved));
   };
-  const disposeTools = registerMemoryTools(ctx, { runtimeFor, identityFor, acceptsSession,
+  const runtimeWithResidentFor = session => {
+    const runtime = runtimeFor(session);
+    if (!runtime) return null;
+    return { ...runtime, residentSnapshot: residentSnapshots.get(session) };
+  };
+  const snapshotFor = async session => {
+    if (residentSnapshots.has(session)) return residentSnapshots.get(session);
+    if (residentLoads.has(session)) return residentLoads.get(session);
+    const load = residentMemory.snapshot(identityFor(session)).then(snapshot => { residentSnapshots.set(session, snapshot); return snapshot; });
+    residentLoads.set(session, load);
+    try { return await load; } finally { residentLoads.delete(session); }
+  };
+  const disposeTools = registerMemoryTools(ctx, { runtimeFor: runtimeWithResidentFor, identityFor, acceptsSession, residentSnapshotFor: snapshotFor,
     // Tool-driven retrieval bypasses the message-path decision gate, so it gets
     // the capture budget rather than the interactive decision budget.
     retrieveBudgetMs: current().captureBudgetMs ?? 60000, rememberBudgetMs: current().captureBudgetMs ?? 60000 });
+  const personaDisposers = new Map();
+  const disposePersona = ctx.on('agent/created', ({ agent }) => {
+    if (!agent?.ctx?.on) return;
+    const off = agent.ctx.on('system-prompt/assemble', async (_assembly, _context, next) => {
+      const snapshot = acceptsSession(agent.session) ? await snapshotFor(agent.session) : undefined;
+      const assembled = await next();
+      if (!snapshot?.soul) return assembled;
+      return { ...assembled, sections: [...assembled.sections, { name:'memory-pilot:soul',text:snapshot.soul,interpolate:false }] };
+    });
+    personaDisposers.set(agent, off);
+  });
+  const disposePersonaSession = ctx.on('session/disposed', session => {
+    for (const [agent, off] of personaDisposers) if (agent.session === session) { off?.(); personaDisposers.delete(agent); }
+  });
   const host = attachHost(ctx, {
     orchestratorFor: session => runtimeFor(session)?.orchestrator,
+    residentSnapshotFor: snapshotFor,
     // Deliberately floored at 60s: the interactive path spends its budget on the
     // decision model plus one round of reads; a tighter value starves the reads.
     retrievalBudgetMs: () => Math.max(current().budgetMs ?? 9000, 60000),
     capture: () => (prepared().backends ?? []).some(binding => binding.scope === 'global' && binding.write === true),
-    captureTurn: turn => runtimeFor(turn.session)?.registry.captureTurn(turn),
+    captureTurn: turn => runtimeFor(turn.session)?.registry?.captureTurn(turn),
     captureBudgetMs: () => current().captureBudgetMs ?? 60000,
     acceptsSession,
     identity: identityFor,
     createMessage: text => createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'plugin:dsh-memory-pilot', form: 'recall' } }),
+    onResidentSnapshot: (session, snapshot, location = {}) => {
+      session.append('plugin/observation', { plugin:'dsh-memory-pilot',kind:'resident-memory',version:1,turn:location.turn??0,
+        summary:'MemoryPilot resident memory loaded',data:{status:'ok',sources:Object.entries(snapshot.resident).filter(([,value])=>Boolean(value)).map(([scope,value])=>({scope,chars:value.length})),soul:Boolean(snapshot.soul)} });
+    },
     onTrace: (session, trace, location = {}) => {
       const scope = trace.executions?.[0]?.scope ?? 'none';
       const engine = trace.executions?.[0]?.engine ?? 'none';
@@ -165,7 +231,11 @@ export function apply(ctx, config) {
   ctx.on('dispose', async () => {
     disposeSettingsRpc?.();
     disposeTools?.();
-    host.dispose();
-    await Promise.allSettled([...runtimes.values()].flatMap(runtime => Object.values(runtime.registry.backends).map(backend => backend.dispose?.())));
+    disposePersona?.();
+    disposePersonaSession?.();
+    for (const off of personaDisposers.values()) off?.();
+    personaDisposers.clear();
+    await host.dispose();
+    await Promise.allSettled([...runtimes.values()].flatMap(runtime => Object.values(runtime.registry?.backends ?? {}).map(backend => backend.dispose?.())));
   });
 }

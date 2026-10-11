@@ -104,9 +104,26 @@ curl -fsSL https://raw.githubusercontent.com/MemTensor/MemOS/main/apps/memos-loc
   | bash -s -- --agent dsh --profile web
 ```
 
-Review remote installation scripts before running them. The bridge defaults to `~/.hermes/memos-plugin`; this is a historical path and does not restrict the integration to Hermes.
+Review remote installation scripts before running them. The bridge defaults to `$DSH_HOME/memos-plugin` (normally `~/.dsh/memos-plugin`). Set `home` explicitly only for a legacy Hermes installation or another custom location.
 
 Do not enable both MemoryPilot-managed MemOS capture and another automatic MemOS DSH plugin for the same store unless duplicate recall and retention are intentional.
+
+## Resident memory
+
+MemoryPilot complements dynamic backends with a small session-start snapshot:
+
+| File | Scope | Maintenance |
+| --- | --- | --- |
+| `$DSH_HOME/SOUL.md` | DSH profile | Human-only agent identity and tone |
+| `$DSH_HOME/memory/USER.md` | Global | Human editing and controlled agent upserts |
+| `$DSH_HOME/memory/MEMORY.md` | Global | Human editing and controlled agent upserts |
+| `$DSH_HOME/memory/projects/<project-key>/MEMORY.md` | Git repository | Human editing and controlled agent upserts |
+
+The snapshot is frozen for a session; changes take effect in the next session. `SOUL.md` contributes trusted persona instructions. USER and MEMORY documents are bounded, untrusted memory data. Automated writes are restricted to a marked managed section and cannot overwrite human-authored notes.
+
+The decision model sees resident memory when deciding whether external retrieval is still needed. For explicit retention, it chooses one authorized target: user profile, global resident memory, project resident memory, or an external backend. It never receives file paths and cannot write `SOUL.md`.
+
+Edit these documents in **Settings → MemoryPilot → Resident memory**.
 
 ## How it works
 

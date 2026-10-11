@@ -33,11 +33,11 @@
           # Requires @memtensor/memos-local-plugin on this machine (one-command
           # DSH installer):
           #   curl -fsSL https://raw.githubusercontent.com/MemTensor/MemOS/main/apps/memos-local-plugin/install.sh | bash -s -- --agent dsh --profile web
-          # `home` defaults to ~/.hermes/memos-plugin (or the agent-specific
-          # default); override only if the plugin lives elsewhere.
+          # `home` defaults to $DSH_HOME/memos-plugin (normally
+          # ~/.dsh/memos-plugin); override only for a custom/legacy location.
           # - id: memos-global
           #   type: memos-bridge
-          #   home: ~/.hermes/memos-plugin
+          #   home: ~/.dsh/memos-plugin
           #   agent: deepseek-harness
           #   scope: global
           #   scopeId: global

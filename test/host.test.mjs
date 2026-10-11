@@ -19,6 +19,15 @@ test('accepted first step injects only memory context and records trace out of b
  assert.equal(result.messages[0],f.decision.messages[0]);assert.equal(result.messages.length,2);assert.equal(result.messages[1].content,'memory');
  assert.equal(JSON.stringify(result.messages).includes('TRACE-ONLY'),false);assert.deepEqual(traces,[['s',{schemaVersion:1,kind:'retrieval',marker:'TRACE-ONLY'}]]);await f.host.dispose();
 });
+test('resident memory is frozen once per session, injected before dynamic recall, and shown to admission decision',async()=>{
+ let loads=0; const snapshots=[];
+ const f=fixture({residentSnapshotFor:async()=>{loads++;return {context:'resident-context',resident:{user:'Chinese',global:'pnpm',project:'ESM'}};},orchestrator:{async run(event){snapshots.push(event.residentMemory);return {context:'dynamic-memory'};}}});
+ const result=await f.agentHooks.get('agent/pre-step')(f.payload,async()=>f.decision);
+ await f.agentHooks.get('agent/pre-step')({...f.payload,turn:2},async()=>f.decision);
+ assert.equal(loads,1);assert.deepEqual(snapshots,[{user:'Chinese',global:'pnpm',project:'ESM'}]);
+ assert.deepEqual(result.messages.slice(1).map(message=>message.content),['resident-context','dynamic-memory']);
+ await f.host.dispose();
+});
 
 test('noop trace is recorded without adding model context',async()=>{
  const traces=[];const f=fixture({onTrace:(_session,trace)=>traces.push(trace),orchestrator:{async run(){return {context:'',status:'noop',trace:{schemaVersion:1,kind:'retrieval',status:'noop'}};}}});

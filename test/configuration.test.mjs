@@ -16,10 +16,10 @@ test('legacy backend bindings migrate into systems and scoped routes', () => {
 test('identity finds the nearest repository from the session cwd within the configured workspace', () => {
   const fs = { existsSync: path => path === '/workspace/repo-a/.git' || path === '/workspace/repo-b/.git' };
   assert.deepEqual(detectIdentity('/workspace/repo-a/packages/app', { workspacePath: '/workspace', workspaceId: 'team' }, fs), {
-    workspacePath: '/workspace', workspaceId: 'team', projectPath: '/workspace/repo-a', projectId: 'repo-a',
+    workspacePath: '/workspace', workspaceId: 'team', projectPath: '/workspace/repo-a', projectId: 'repo-a', projectKey: 'c3c4501876069600',
   });
   assert.deepEqual(detectIdentity('/workspace/repo-b/src', { workspacePath: '/workspace', workspaceId: 'team' }, fs), {
-    workspacePath: '/workspace', workspaceId: 'team', projectPath: '/workspace/repo-b', projectId: 'repo-b',
+    workspacePath: '/workspace', workspaceId: 'team', projectPath: '/workspace/repo-b', projectId: 'repo-b', projectKey: 'd3aa593e26cb1ff2',
   });
 });
 
@@ -45,14 +45,14 @@ test('workspace matching selects the longest registered ancestor among five work
 test('identity uses the matched registered workspace path and stable id', () => {
   const fs = { existsSync: path => path === '/work/app/repo/.git' };
   assert.deepEqual(detectIdentity('/work/app/repo/src', { workspacePath: '/work/app', workspaceId: 'stable-workspace' }, fs), {
-    workspacePath: '/work/app', workspaceId: 'stable-workspace', projectPath: '/work/app/repo', projectId: 'repo',
+    workspacePath: '/work/app', workspaceId: 'stable-workspace', projectPath: '/work/app/repo', projectId: 'repo', projectKey: '699617f5cde91aef',
   });
 });
 
 test('repository detection never crosses the explicit workspace root', () => {
   const fs = { existsSync: path => path === '/outside/.git' };
   assert.deepEqual(detectIdentity('/workspace/plain/subdir', { workspacePath: '/workspace' }, fs), {
-    workspacePath: '/workspace', workspaceId: '/workspace', projectPath: '/workspace', projectId: 'workspace',
+    workspacePath: '/workspace', workspaceId: '/workspace', projectPath: '/workspace', projectId: 'workspace', projectKey: 'c52ddf65534b7b46',
   });
 });
 

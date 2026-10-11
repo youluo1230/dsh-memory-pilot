@@ -125,6 +125,37 @@ test('remote settings RPC sanitizes discovery failures', async () => {
   assert.deepEqual(await rpc('discover', {}), { ok: false, error: { code: 'discovery-failed', message: 'MemoryPilot scope discovery failed' } });
 });
 
+test('remote settings RPC reads and human-edits resident documents with revision fencing',async()=>{
+ const settings={writable:true,describe:()=>[descriptor()]};const writes=[];
+ const rpc=createSettingsRpcHandler(settings,{residentMemory:{inspect:async identity=>({soul:{content:'Persona',revision:'s1',path:'/dsh/SOUL.md',writable:true},user:{content:'User',revision:'u1',path:'/dsh/memory/USER.md',writable:true},globalMemory:{content:'Global',revision:'g1',path:'/dsh/memory/MEMORY.md',writable:true},projectMemory:{content:identity.projectPath||'',revision:'p1',path:'/dsh/memory/projects/x/MEMORY.md',writable:true}}),apply:async(plan,revision,identity)=>{writes.push({plan,revision,identity});return{content:plan.content,revision:'next',path:'/saved',writable:true};}}});
+ const read=await rpc('resident-get',{projectPath:'/repo'});assert.equal(read.ok,true);assert.equal(read.value.projectMemory.content,'/repo');
+ const saved=await rpc('resident-put',{target:'soul',content:'New persona',revision:'s1',projectPath:'/repo'});assert.equal(saved.ok,true);assert.deepEqual(writes,[{plan:{target:'soul',content:'New persona',actor:'human'},revision:'s1',identity:{projectPath:'/repo'}}]);
+});
+
+test('resident RPC emits content-free audit after a human write',async()=>{
+ const audits=[];const rpc=createSettingsRpcHandler({writable:true,describe:()=>[descriptor()]},{residentMemory:{inspect:async()=>({}),apply:async()=>({revision:'next'})},onAudit:record=>audits.push(record)});
+ assert.equal((await rpc('resident-put',{target:'user',content:'Secret preference',revision:'old'})).ok,true);
+ assert.deepEqual(audits,[{kind:'resident-retention',actor:'human',target:'user',status:'ok',previousRevision:'old',revision:'next'}]);assert.equal(JSON.stringify(audits).includes('Secret'),false);
+});
+
+test('installed settings RPC requires project identity only for project memory',async()=>{
+ const settings={writable:true,describe:()=>[descriptor()]};let handler,resolutions=0;
+ const ctx={settings,connection:{rpc:{handle(_channel,value){handler=value;return()=>{}}}}};
+ const {installSettingsRpc}=await import('../src/settings-rpc.mjs');
+ installSettingsRpc(ctx,{residentMemory:{inspect:async identity=>({identity}),apply:async(plan)=>({target:plan.target})},resolveIdentity:()=>{resolutions++;throw new Error('missing project')}});
+ assert.equal((await handler('resident-get',{})).ok,true);assert.equal(resolutions,0);
+ assert.equal((await handler('resident-put',{target:'soul',content:'Persona',revision:'r'})).ok,true);assert.equal(resolutions,0);
+ assert.equal((await handler('resident-put',{target:'project-memory',content:'Fact',revision:'r'})).ok,false);assert.equal(resolutions,1);
+});
+
+test('installed settings RPC resolves project paths to authoritative project identities',async()=>{
+ const settings={writable:true,describe:()=>[descriptor()]};let handler,seen;
+ const ctx={settings,connection:{rpc:{handle(_channel,value){handler=value;return()=>{}}}},workspaceRegistry:{list:()=>[]}};
+ const {installSettingsRpc}=await import('../src/settings-rpc.mjs');
+ installSettingsRpc(ctx,{residentMemory:{inspect:async identity=>{seen=identity;return{}},apply:async()=>({})},resolveIdentity:path=>({projectId:'repo-id',projectPath:path})});
+ assert.equal((await handler('resident-get',{projectPath:'/repo'})).ok,true);assert.deepEqual(seen,{projectId:'repo-id',projectPath:'/repo'});
+});
+
 test('remote settings RPC sanitizes provider failures', async () => {
   const settings = { writable: true, describe: () => [descriptor()], mutate: async () => { throw new Error('secret upstream detail'); } };
   const rpc = createSettingsRpcHandler(settings);

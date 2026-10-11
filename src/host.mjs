@@ -1,5 +1,5 @@
 // DSH-specific lifecycle adapter. No host imports: the same seam is used by tests.
-export function attachHost(ctx, { orchestrator, orchestratorFor = () => orchestrator, createMessage, identity, acceptsSession = () => true, retrievalBudgetMs = 60000, capture = false, captureTurn, captureBudgetMs = 60000, maxTextChars = 12000, onTrace = () => {}, onError = () => {} }) {
+export function attachHost(ctx, { orchestrator, orchestratorFor = () => orchestrator, createMessage, identity, residentSnapshotFor, acceptsSession = () => true, retrievalBudgetMs = 60000, capture = false, captureTurn, captureBudgetMs = 60000, maxTextChars = 12000, onResidentSnapshot = () => {}, onTrace = () => {}, onError = () => {} }) {
   // capture/captureBudgetMs may be callables so a plugin backed by live
   // (volatile) config can re-evaluate them per event without remounting.
   const captureOn = typeof capture === 'function' ? capture : () => capture === true;
@@ -24,26 +24,35 @@ export function attachHost(ctx, { orchestrator, orchestratorFor = () => orchestr
     // waterfalls replace the entered decision, while payload.messages is the
     // authoritative user batch for this proposed step.
     const claimedText = (payload.messages || []).filter(m => m.source?.kind === 'user').map(m => text(m.content)).join('\n').slice(0, maxTextChars);
+    const session = payload.agent.session;
+    let resident;
+    if (payload.step === 1 && claimedText && acceptsSession(session)) {
+      try {
+        resident = typeof residentSnapshotFor === 'function' ? await residentSnapshotFor(session) : undefined;
+        if (resident) try { onResidentSnapshot(session,resident,{turn:payload.turn,step:payload.step}); } catch { /* audit only */ }
+      } catch { onError('resident_snapshot_failed'); }
+    }
     const decision = await next();
     if (disposed || payload.signal?.aborted || payload.step !== 1 || decision.kind !== 'enter') return decision;
     const userText = claimedText || decision.messages.filter(m => m.source?.kind === 'user').map(m => text(m.content)).join('\n').slice(0, maxTextChars);
     if (!userText) return decision;
-    const session = payload.agent.session;
     if (!acceptsSession(session)) return decision;
     const id = key(session, payload.turn);
     // Do not persist reasoning, tool credentials, or memory-injection messages.
     turns.set(id, { userText, assistantText: '', session, turn: payload.turn });
     const visible = decision.messages.filter(message => ['user','assistant'].includes(message.source?.kind))
       .map(message => `${message.source.kind}: ${text(message.content)}`.slice(0,2000)).filter(line => !line.endsWith(': ')).slice(-12);
-    const event = { ...describe(session, payload.turn, 'message', userText), availableContext: visible };
+    const event = { ...describe(session, payload.turn, 'message', userText), availableContext: visible,
+      ...(resident?.resident ? { residentMemory: resident.resident } : {}) };
     const result = await safeRun(session, event, { budgetMs: typeof retrievalBudgetMs === 'function' ? retrievalBudgetMs() : retrievalBudgetMs });
     if (disposed || payload.signal?.aborted) return decision;
     if (result.trace) {
       try { Promise.resolve(onTrace(session, result.trace, { turn: payload.turn, step: payload.step })).catch(() => {}); }
       catch { /* Observability must not alter execution or model context. */ }
     }
-    if (!result.context) return decision;
-    return { ...decision, messages: [...decision.messages, createMessage(result.context)] };
+    const additions = [resident?.context, result.context].filter(Boolean).map(createMessage);
+    if (!additions.length) return decision;
+    return { ...decision, messages: [...decision.messages, ...additions] };
   };
   const agentListeners = new Map();
   const registrations = [ctx.on('agent/created', ({ agent }) => {

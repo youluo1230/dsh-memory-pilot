@@ -7,7 +7,7 @@ const bounded = (value, name) => {
   return value.trim();
 };
 
-export function registerMemoryTools(ctx, { runtimeFor, identityFor, acceptsSession = () => true, retrieveBudgetMs = 60000, rememberBudgetMs = 60000 }) {
+export function registerMemoryTools(ctx, { runtimeFor, identityFor, residentSnapshotFor, acceptsSession = () => true, retrieveBudgetMs = 60000, rememberBudgetMs = 60000 }) {
   const owner = exec => {
     const session = exec.agent?.session;
     if (!session) throw new Error('Memory tool requires an owning agent session');
@@ -38,7 +38,13 @@ export function registerMemoryTools(ctx, { runtimeFor, identityFor, acceptsSessi
     async execute(args, exec) {
       const { session, runtime } = owner(exec);
       if (!runtime) return { status:'disabled',accepted:0 };
-      const result = await runtime.orchestrator.run(event(session,exec.callId,'checkpoint',bounded(args.content,'content')),{budgetMs:rememberBudgetMs,signal:exec.signal});
+      const memoryEvent = event(session,exec.callId,'checkpoint',bounded(args.content,'content'));
+      if (runtime.retentionRouter) {
+        const snapshot = runtime.residentSnapshot ?? (typeof residentSnapshotFor === 'function' ? await residentSnapshotFor(session) : undefined);
+        const result = await runtime.retentionRouter.retain(memoryEvent, snapshot, identityFor(session), { signal: exec.signal });
+        return { status: result.status, accepted: result.accepted ?? 0 };
+      }
+      const result = await runtime.orchestrator.run(memoryEvent,{budgetMs:rememberBudgetMs,signal:exec.signal});
       return { status:result.status,accepted:(result.results||[]).filter(row=>row.operation==='write'&&row.status==='ok').length };
     },
   });

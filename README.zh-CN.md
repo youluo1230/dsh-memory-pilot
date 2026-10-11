@@ -104,9 +104,26 @@ curl -fsSL https://raw.githubusercontent.com/MemTensor/MemOS/main/apps/memos-loc
   | bash -s -- --agent dsh --profile web
 ```
 
-执行远程安装脚本前，请先审阅脚本。桥接器默认查找 `~/.hermes/memos-plugin`；这是历史默认路径，并不表示它只能用于 Hermes。
+执行远程安装脚本前，请先审阅脚本。桥接器默认查找 `$DSH_HOME/memos-plugin`（通常为 `~/.dsh/memos-plugin`）；只有旧版 Hermes 安装或自定义位置才需要手动填写 `home`。
 
 除非明确需要重复召回和写入，否则不要让 MemoryPilot 管理的 MemOS 捕获与其他自动 MemOS DSH 插件同时操作同一个存储。
+
+## 常驻记忆
+
+MemoryPilot 在动态后端之外提供一份小型的会话启动快照：
+
+| 文件 | 范围 | 维护方式 |
+| --- | --- | --- |
+| `$DSH_HOME/SOUL.md` | DSH profile | 仅人工维护 Agent 身份和语气 |
+| `$DSH_HOME/memory/USER.md` | 全局 | 人工编辑和受控 Agent 更新 |
+| `$DSH_HOME/memory/MEMORY.md` | 全局 | 人工编辑和受控 Agent 更新 |
+| `$DSH_HOME/memory/projects/<project-key>/MEMORY.md` | Git 仓库 | 人工编辑和受控 Agent 更新 |
+
+快照在当前会话中保持不变，修改从下一个会话生效。`SOUL.md` 作为可信人格指令；USER 和 MEMORY 文档是有长度限制的不可信记忆数据。自动写入只能修改带标记的托管区，不能覆盖用户手写内容。
+
+决策模型在判断是否还需查询外部记忆时会看到常驻记忆。明确保存内容时，它只能选择用户画像、全局常驻记忆、项目常驻记忆或外部后端之一；它看不到真实文件路径，也不能写入 `SOUL.md`。
+
+可在 **设置 → MemoryPilot → 常驻记忆** 中编辑这些文档。
 
 ## 工作原理
 

@@ -18,6 +18,8 @@
     "./configuration": "./src/configuration.mjs",
     "./discovery": "./src/discovery.mjs",
     "./tools": "./src/tools.mjs",
+    "./resident-memory": "./src/resident-memory.mjs",
+    "./retention-router": "./src/retention-router.mjs",
     "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
@@ -32,7 +34,7 @@
   ],
   "scripts": {
     "test": "node --test",
-    "check": "node --check src/core.mjs && node --check src/adapters.mjs && node --check src/host.mjs && node --check src/plugin.mjs && node --check src/registry.mjs && node --check src/memos-http.mjs && node --check src/memos-bridge.mjs && node --check src/settings-rpc.mjs && node --check src/discovery.mjs && node --check src/configuration.mjs && node --check src/tools.mjs && node --check src/connection-test.mjs && node --check lib/client.js"
+    "check": "node --check src/core.mjs && node --check src/adapters.mjs && node --check src/host.mjs && node --check src/plugin.mjs && node --check src/registry.mjs && node --check src/memos-http.mjs && node --check src/memos-bridge.mjs && node --check src/settings-rpc.mjs && node --check src/discovery.mjs && node --check src/configuration.mjs && node --check src/tools.mjs && node --check src/connection-test.mjs && node --check src/resident-targets.mjs && node --check src/resident-memory.mjs && node --check src/retention-router.mjs && node --check lib/client.js"
   },
   "engines": {
     "node": ">=22"

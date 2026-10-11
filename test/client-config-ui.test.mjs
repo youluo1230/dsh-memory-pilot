@@ -52,10 +52,41 @@ test('noop trajectory marks subordinate answers inactive instead of implying rec
   assert.match(detail, /Selected scopes: none/);
 });
 
-test('configuration page exposes the four required horizontal tabs and DSH-token CSS', () => {
+test('resident memory public document contract names all editable targets and maintenance policies', () => {
+  const { residentDocumentOptions } = loadClient();
+  const documents = residentDocumentOptions({
+    soul: { content: '# Soul', revision: 's1', path: '/home/SOUL.md', writable: true },
+    user: { content: '# User', revision: 'u1', path: '/home/USER.md', writable: true, managed: true },
+    globalMemory: { content: '# Memory', revision: 'g1', path: '/home/MEMORY.md', writable: true, managed: true },
+    projectMemory: { content: '# Project', revision: 'p1', path: '/repo/MEMORY.md', writable: false },
+  });
+
+  assert.deepEqual(Array.from(documents, item => item.target), ['soul', 'user', 'global-memory', 'project-memory']);
+  assert.deepEqual(Array.from(documents, item => item.label), ['SOUL', 'USER', '全局 MEMORY', '项目 MEMORY']);
+  assert.equal(documents[0].manualOnly, true);
+  assert.equal(documents[1].manualOnly, false);
+  assert.equal(documents[2].document.revision, 'g1');
+  assert.equal(documents[3].document.writable, false);
+});
+
+test('resident memory tab DOM contract explains lifecycle and controlled maintenance', () => {
+  assert.match(source, /\["resident",\s*"常驻记忆"\]/);
+  assert.match(source, /SOUL 只能人工修改/);
+  assert.match(source, /修改将在新会话中生效/);
+  assert.match(source, /USER\/MEMORY 可人工修改，也可由受控自动维护/);
+  assert.match(source, /"aria-label":\s*"常驻记忆文档"/);
+  assert.match(source, /className:\s*"mp-resident-editor"/);
+  assert.match(source, /residentGet\(selectedResidentPath/);
+  assert.match(source, /residentPut\(selected\.target, residentContent, selected\.document\.revision, selectedResidentPath/);
+  assert.match(source, /项目 MEMORY 所属仓库/);
+  assert.match(source, /active === "scope" \|\| active === "resident"/);
+});
+
+test('configuration page exposes the required horizontal tabs and DSH-token CSS', () => {
   assert.match(source, /\["decision",\s*"决策模型"\]/);
   assert.match(source, /\["systems",\s*"记忆系统"\]/);
   assert.match(source, /\["scope",\s*"使用范围"\]/);
+  assert.match(source, /\["resident",\s*"常驻记忆"\]/);
   assert.match(source, /\["advanced",\s*"高级设置"\]/);
   assert.match(source, /max-width:\s*820px/);
   assert.match(source, /var\(--dsw-alias-border-l2\)/);

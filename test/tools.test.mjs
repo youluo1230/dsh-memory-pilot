@@ -23,6 +23,19 @@ test('retrieve and remember resolve the calling agent session and return safe ca
  assert.deepEqual(await remember.execute({content:'durable decision'},exec(session)),{status:'ok',accepted:1});
  assert.equal(f.runs[0].session,session); assert.equal(f.runs[0].event.type,'message'); assert.equal(f.runs[1].event.type,'checkpoint'); assert.equal(f.runs[0].event.workspaceId,'w1');
 });
+test('remember routes between resident files and external memory through one policy decision',async()=>{
+ const definitions=[];const ctx={tools:{register(def){definitions.push(def);return()=>{}}}};const retained=[];
+ registerMemoryTools(ctx,{runtimeFor:()=>({retentionRouter:{retain:async(event,snapshot,identity)=>{retained.push({event,snapshot,identity});return{status:'ok',accepted:1,target:'project-memory'}}},residentSnapshot:{resident:{user:'',global:'',project:''},revisions:{user:'u',global:'g',project:'p'}}}),identityFor:()=>({projectId:'repo',projectPath:'/repo'}),acceptsSession:()=>true});
+ const remember=definitions.find(tool=>tool.name==='memory_remember');const session={id:'s',header:{cwd:'/repo'}};
+ assert.deepEqual(await remember.execute({content:'Use ESM.'},exec(session)),{status:'ok',accepted:1});
+ assert.equal(retained[0].event.type,'checkpoint');assert.equal(retained[0].identity.projectId,'repo');
+});
+test('remember can route to resident memory without an external orchestrator',async()=>{
+ const definitions=[];const ctx={tools:{register(def){definitions.push(def);return()=>{}}}};let calls=0;
+ registerMemoryTools(ctx,{runtimeFor:()=>({retentionRouter:{retain:async()=>{calls++;return{status:'ok',accepted:1}}}}),residentSnapshotFor:async()=>({resident:{},revisions:{}}),identityFor:()=>({projectId:'repo'}),acceptsSession:()=>true});
+ const remember=definitions.find(tool=>tool.name==='memory_remember');assert.deepEqual(await remember.execute({content:'Use pnpm.'},exec({id:'s'})),{status:'ok',accepted:1});assert.equal(calls,1);
+});
+
 test('tools fail closed without an accepted owning session',async()=>{
  const f=fixture(); const tool=f.definitions[0];
  await assert.rejects(tool.execute({query:'x',mode:'auto'},{signal:new AbortController().signal}),/owning agent session/);

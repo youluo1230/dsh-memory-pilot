@@ -20,7 +20,7 @@ export function createRegistry({ bindings, identities, env = process.env, factor
     const specific = item.type === 'memos'
       ? { sessionCookie: item.cookieEnv ? env[item.cookieEnv] : undefined, isolatedStore: item.isolatedStore === true }
       : item.type === 'memos-bridge'
-        ? { home: item.home || join(homedir(), '.hermes', 'memos-plugin'), agent: item.agent || 'deepseek-harness' }
+        ? { home: item.home || join(env.DSH_HOME || join(homedir(), '.dsh'), 'memos-plugin'), agent: item.agent || 'deepseek-harness' }
         : { bank: item.bank };
     const backend = factories[item.type]({
       baseUrl: item.baseUrl, scope: item.scope, scopeId, apiKey, ...specific,

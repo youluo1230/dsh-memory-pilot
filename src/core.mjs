@@ -84,6 +84,11 @@ export function createOrchestrator({ decision, backends = {}, policy = {}, onAud
       if (!Array.isArray(input.availableContext) || input.availableContext.length > 12 || !input.availableContext.every(value => typeof value === 'string' && value.length <= 2000)) return null;
       event.availableContext = Object.freeze([...input.availableContext]);
     }
+    if (input.residentMemory !== undefined) {
+      if (!object(input.residentMemory) || Object.keys(input.residentMemory).some(key => !['user', 'global', 'project'].includes(key))
+        || Object.values(input.residentMemory).some(value => typeof value !== 'string' || value.length > 8000)) return null;
+      event.residentMemory = Object.freeze({ ...input.residentMemory });
+    }
     for (const key of ['actorId', 'projectId', 'workspaceId', 'projectPath', 'workspacePath']) {
       if (input[key] !== undefined && !identifier(input[key])) return null;
       if (input[key] !== undefined) event[key] = input[key];

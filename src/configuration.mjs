@@ -1,5 +1,6 @@
 import { basename, dirname, resolve, sep } from 'node:path';
 import { existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 
 const clean = value => typeof value === 'string' ? value.trim() : '';
 const identifier = value => clean(value).replace(/[^a-zA-Z0-9._:-]+/g, '-').replace(/^-+|-+$/g, '') || 'workspace';
@@ -35,6 +36,7 @@ export function detectIdentity(cwd, overrides = {}, fs = { existsSync }) {
     workspaceId: clean(overrides.workspaceId) || workspacePath,
     projectPath,
     projectId: identifier(basename(projectPath)),
+    projectKey: createHash('sha256').update(projectPath).digest('hex').slice(0,16),
   };
 }
 

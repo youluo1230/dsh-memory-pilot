@@ -66,6 +66,12 @@ test('SystemOne decision posts choice questions to exact endpoint with optional 
   assert.deepEqual(Object.keys(calls[0].body.questions.write_scope_project.criteria), ['skip','write']);
 });
 
+test('SystemOne retrieval admission receives resident memory as coverage context without treating it as instructions', async () => {
+  const input={event:{id:'e1',type:'message',text:'Which package manager do I prefer?',residentMemory:{user:'Prefers pnpm.',global:'',project:''},projectId:'repo'},capabilities:[{backend:'h',scope:'project',scopeId:'repo',operations:['search']}]};
+  const decision=createSystemOneDecision({baseUrl:'https://example.invalid/v1',model:'jev',fetchImpl:async(_url,init)=>{const body=JSON.parse(init.body);const state=JSON.parse(body.state);assert.deepEqual(state.event.residentMemory,input.event.residentMemory);assert.match(state.decisionContext.counterfactual,/resident/i);return reply({answers:{recall_gate:{type:'choice',choice:'none'},retrieval_mode:{type:'choice',choice:'recall'},scope_project:{type:'choice',choice:'skip'}}});}});
+  assert.deepEqual((await decision.decide(input)).actions,[]);
+});
+
 test('SystemOne retrieval admission uses one hierarchical response and no-memory gate overrides mode and scopes', async () => {
   const input = {
     event: { id: 'e1', type: 'message', text: 'Why did we choose this design?', workspaceId: 'work-1', workspacePath: '/work', projectId: 'repo-1', projectPath: '/work/repo' },
@@ -148,6 +154,12 @@ test('SystemOne decision maps safe choice keys to bounded core actions and noop'
   assert.deepEqual((await decision.decide(input)).actions, []);
 });
 
+test('SystemOne resident retention decision removes explicit command wording before stable upsert',async()=>{
+ const decision=createSystemOneDecision({baseUrl:'https://example.invalid/v1',model:'jev',fetchImpl:async(_url,init)=>{const body=JSON.parse(init.body);assert.deepEqual(Object.keys(body.questions),['retention_gate','resident_target']);return reply({answers:{retention_gate:{type:'choice',choice:'retain'},resident_target:{type:'choice',choice:'user'}}});}});
+ const input={event:{id:'e1',type:'checkpoint',text:'Remember that I prefer pnpm.'},resident:{user:'',global:'',project:''},availableTargets:['user','global-memory','project-memory','external']};
+ const result=await decision.decideRetention(input);assert.equal(result.target,'user');assert.equal(result.content,'I prefer pnpm.');assert.match(result.key,/^[a-f0-9]{16}$/);assert.deepEqual(result.evidence,{eventId:'e1',quote:input.event.text});
+});
+
 test('SystemOne retention gate rejects unrelated or ephemeral content regardless of scope answers',async()=>{
  const input={event:{id:'c1',type:'checkpoint',text:'Temporary build output for this run',workspaceId:'w',projectId:'p'},capabilities:[{backend:'h',scope:'project',scopeId:'p',operations:['write']}]};
  const decision=createSystemOneDecision({baseUrl:'https://example.invalid/v1',model:'jev',fetchImpl:async(_url,init)=>{const {questions,state}=JSON.parse(init.body);assert.match(JSON.parse(state).decisionContext.rejectWhen,/temporary/i);return reply({answers:{retention_gate:{type:'choice',choice:'discard'},write_scope_project:{type:'choice',choice:'write'}}});}});
@@ -184,6 +196,17 @@ test('decision refuses malformed JSON, unknown keys, invalid actions, missing ev
     const decision = createOpenAICompatibleDecision({ baseUrl: 'https://example.invalid/v1', model: 'small', fetchImpl: async () => decisionReply(output) });
     await assert.rejects(decision.decide({}));
   }
+});
+
+test('OpenAI retention routing rejects external when it is not authorized',async()=>{
+ const decision=createOpenAICompatibleDecision({baseUrl:'https://example.invalid/v1',model:'m',fetchImpl:async()=>reply({choices:[{message:{content:JSON.stringify({target:'external'})}}]})});
+ await assert.rejects(decision.decideRetention({event:{id:'e1',text:'Remember this.'},resident:{},availableTargets:['user']}),/retention plan/i);
+});
+
+test('OpenAI retention routing returns a validated resident plan without exposing file paths',async()=>{
+ const decision=createOpenAICompatibleDecision({baseUrl:'https://example.invalid/v1',model:'m',fetchImpl:async(_url,init)=>{const body=JSON.parse(init.body);assert.match(body.messages[0].content,/resident retention/i);return reply({choices:[{message:{content:JSON.stringify({target:'project-memory',key:'runtime',content:'This repository requires Node.js 22.',evidence:{eventId:'e1',quote:'requires Node.js 22'}})}}]});}});
+ const input={event:{id:'e1',type:'checkpoint',text:'This repository requires Node.js 22.'},resident:{user:'',global:'',project:''},availableTargets:['user','global-memory','project-memory','external']};
+ assert.deepEqual(await decision.decideRetention(input),{target:'project-memory',key:'runtime',content:'This repository requires Node.js 22.',evidence:{eventId:'e1',quote:'requires Node.js 22'}});
 });
 
 test('decision forwards cancellation and enforces timeout without leaking remote errors', async () => {

@@ -1,5 +1,6 @@
 import { readdir } from 'node:fs/promises';
 import { basename, relative, resolve } from 'node:path';
+import { createHash } from 'node:crypto';
 import { bindingsForIdentity, normalizeConfiguration } from './configuration.mjs';
 
 const SKIP_DIRECTORIES = new Set(['node_modules', '.git', 'build', 'dist', 'coverage', '.next', '.cache', 'out', 'target']);
@@ -113,8 +114,8 @@ export async function discoverScope(config = {}, {
     const identityBase = { workspaceId, workspacePath, actorId: clean(config.actorId) };
     const paths = await findRepositories(workspacePath, { signal: boundedSignal, maxRepositories });
     const repositories = paths.map(path => {
-      const identity = { ...identityBase, projectId: repositoryId(path), projectPath: path };
-      return { path: relative(workspacePath, path) || '.', id: identity.projectId,
+      const identity = { ...identityBase, projectId: repositoryId(path), projectPath: path, projectKey: createHash('sha256').update(path).digest('hex').slice(0,16) };
+      return { path: relative(workspacePath, path) || '.', projectRef: `${workspaceId}::${relative(workspacePath, path) || '.'}`, id: identity.projectId,
         targetBanks: targetsFor(config, identity, routeSystems, available, matched, binding => binding.scope === 'project') };
     });
     const rootIdentity = { ...identityBase, projectId: repositoryId(workspacePath), projectPath: workspacePath };

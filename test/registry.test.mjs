@@ -32,10 +32,12 @@ test('memos-bridge binds a local home without baseUrl and receives bridge option
  const r=createRegistry({bindings:[binding('bridge','memos-bridge','project','p',{home:'/srv/memos'})],identities:{project:'p'},factories:{'memos-bridge':()=>({capabilities:['search','write'],execute:async()=>({text:'x'})})}});
  assert.ok(r.backends.bridge.capabilities.includes('search'));
 });
-test('memos-bridge public registry defaults empty local connection settings',()=>{
- let options;createRegistry({bindings:[binding('bridge','memos-bridge','project','p',{baseUrl:'',home:'',agent:''})],identities:{project:'p'},factories:{'memos-bridge':o=>{options=o;return{capabilities:['search','write'],execute:async()=>({text:'x'})}}}});
- assert.equal(options.home,join(homedir(),'.hermes','memos-plugin'));
+test('memos-bridge defaults to the DSH-local plugin home and honors DSH_HOME',()=>{
+ let options;createRegistry({bindings:[binding('bridge','memos-bridge','project','p',{baseUrl:'',home:'',agent:''})],identities:{project:'p'},env:{DSH_HOME:'/srv/dsh'},factories:{'memos-bridge':o=>{options=o;return{capabilities:['search','write'],execute:async()=>({text:'x'})}}}});
+ assert.equal(options.home,join('/srv/dsh','memos-plugin'));
  assert.equal(options.agent,'deepseek-harness');
+ let fallback;createRegistry({bindings:[binding('bridge','memos-bridge','project','p',{baseUrl:'',home:'',agent:''})],identities:{project:'p'},env:{},factories:{'memos-bridge':o=>{fallback=o;return{capabilities:['search','write'],execute:async()=>({text:'x'})}}}});
+ assert.equal(fallback.home,join(homedir(),'.dsh','memos-plugin'));
 });
 test('http backends still require baseUrl and apiKey literal is the fallback',()=>{
  assert.throws(()=>createRegistry({bindings:[binding('a','hindsight','global','global',{baseUrl:''})],identities:{},factories}));

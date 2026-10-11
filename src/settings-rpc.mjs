@@ -1,3 +1,5 @@
+import { isResidentTarget, RESIDENT_TARGETS } from './resident-targets.mjs';
+
 export const SETTINGS_RPC_CHANNEL = '/dsh-memory-pilot-settings';
 export const SETTINGS_NAMESPACE = 'dsh-memory-pilot';
 
@@ -25,7 +27,7 @@ function validOps(ops) {
     && ALLOWED_FIELDS.has(op.path[0]));
 }
 
-export function createSettingsRpcHandler(settings, { discover, createBank, testConnection } = {}) {
+export function createSettingsRpcHandler(settings, { discover, createBank, testConnection, residentMemory, onAudit = () => {} } = {}) {
   const safeDiscover = typeof discover === 'function' ? discover : async () => ({ workspacePath: '', repositories: [], banks: [] });
   const safeCreateBank = typeof createBank === 'function' ? createBank : async () => { throw new Error('Bank creation unavailable'); };
   const safeTestConnection = typeof testConnection === 'function' ? testConnection : async () => { throw new Error('Connection testing unavailable'); };
@@ -77,6 +79,25 @@ export function createSettingsRpcHandler(settings, { discover, createBank, testC
         return fail('test-failed', error instanceof Error && error.message ? error.message : 'MemoryPilot connection test failed');
       }
     }
+    if (endpoint === 'resident-get') {
+      if (!residentMemory || !payload || typeof payload !== 'object' || Array.isArray(payload)
+        || Object.keys(payload).some(key => key !== 'projectPath') || (payload.projectPath !== undefined && typeof payload.projectPath !== 'string')) return fail('bad-request','Invalid resident memory request');
+      try { return { ok:true,value:await residentMemory.inspect({projectPath:payload.projectPath}) }; }
+      catch { return fail('resident-read-failed','Resident memory could not be read'); }
+    }
+    if (endpoint === 'resident-put') {
+      if (!residentMemory || !payload || typeof payload !== 'object' || Array.isArray(payload)
+        || Object.keys(payload).some(key => !['target','content','revision','projectPath'].includes(key))
+        || !isResidentTarget(payload.target)
+        || typeof payload.content !== 'string' || typeof payload.revision !== 'string'
+        || (payload.projectPath !== undefined && typeof payload.projectPath !== 'string')) return fail('bad-request','Invalid resident memory mutation');
+      try {
+        const value=await residentMemory.apply({target:payload.target,content:payload.content,actor:'human'},payload.revision,{projectPath:payload.projectPath});
+        try { onAudit({kind:'resident-retention',actor:'human',target:payload.target,status:'ok',previousRevision:payload.revision,revision:value?.revision}); } catch {}
+        return {ok:true,value};
+      }
+      catch { try { onAudit({kind:'resident-retention',actor:'human',target:payload.target,status:'error'}); } catch {} return fail('resident-write-failed','Resident memory changed; reload and try again'); }
+    }
     if (endpoint !== 'mutate') return fail('bad-request', 'Unknown MemoryPilot settings operation');
     if (!validOps(payload?.ops) || !Number.isSafeInteger(payload?.revision) || payload.revision < 0) {
       return fail('bad-request', 'Invalid MemoryPilot configuration mutation');
@@ -114,7 +135,7 @@ function registerChannel(ctx, handler) {
   }
 }
 
-export function installSettingsRpc(ctx, { getConfig, discover, createBank } = {}) {
+export function installSettingsRpc(ctx, { getConfig, discover, createBank, testConnection, residentMemory, resolveIdentity, onAudit } = {}) {
   if (!ctx?.connection?.rpc?.handle || !ctx?.settings) return () => {};
   const safeDiscover = typeof discover === 'function' ? discover : async ({ signal } = {}) => {
     if (typeof getConfig !== 'function') return { workspacePath: '', repositories: [], banks: [] };
@@ -129,5 +150,10 @@ export function installSettingsRpc(ctx, { getConfig, discover, createBank } = {}
     const { createHindsightBank } = await import('./discovery.mjs');
     return createHindsightBank(getConfig(), target, { signal });
   };
-  return registerChannel(ctx, createSettingsRpcHandler(ctx.settings, { discover: safeDiscover, createBank: safeCreateBank }));
+  const scopedResident = residentMemory && typeof resolveIdentity === 'function' ? {
+    inspect: identity => residentMemory.inspect(identity?.projectPath ? resolveIdentity(identity.projectPath) : {}),
+    apply: (plan, revision, identity) => residentMemory.apply(plan, revision,
+      RESIDENT_TARGETS[plan.target]?.requiresProject ? resolveIdentity(identity?.projectPath) : {}),
+  } : residentMemory;
+  return registerChannel(ctx, createSettingsRpcHandler(ctx.settings, { discover: safeDiscover, createBank: safeCreateBank, testConnection, residentMemory: scopedResident, onAudit }));
 }

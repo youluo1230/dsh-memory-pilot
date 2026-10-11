@@ -12,6 +12,14 @@ test('non-loopback clients use the authenticated MemoryPilot RPC form', () => {
   assert.match(source, /connection\.rpc\.call\(SETTINGS_RPC_CHANNEL, "create-bank", \{ systemId, bank \}\)/);
 });
 
+test('authenticated forms expose resident memory get and optimistic put RPCs', () => {
+  assert.match(source, /residentGet\(projectPath\)[\s\S]*?"resident-get", projectPath \? \{ projectPath \} : \{\}/);
+  assert.match(source, /residentPut\(target, content, revision, projectPath\)[\s\S]*?"resident-put", \{ target, content, revision, \.\.\.\(projectPath \? \{ projectPath \} : \{\}\) \}/);
+  assert.equal((source.match(/"resident-get"/g) || []).length, 1, 'forms share one authenticated resident RPC implementation');
+  assert.equal((source.match(/"resident-put"/g) || []).length, 1, 'forms share one authenticated resident RPC implementation');
+  assert.match(source,/\.\.\.residentRpc\(ctx\.connection\)/);
+});
+
 test('loopback clients expose createBank through the same RPC channel', () => {
   assert.match(source, /ctx\.connection\.isLoopback \? \{[\s\S]*?createBank\(systemId, bank\)[\s\S]*?"create-bank", \{ systemId, bank \}/);
 });
