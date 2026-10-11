@@ -1,6 +1,39 @@
 # MemoryPilot — 智能记忆调度
 
-决策模型驱动的统一记忆编排插件(0.1.0)。决策模型在每轮选择是否召回、查哪个后端、查多深、何时写入;程序只负责授权、能力校验、预算和审计。
+[![tests](https://img.shields.io/badge/tests-143%20passing-brightgreen)]() [![node](https://img.shields.io/badge/node-%E2%89%A518-blue)]()
+
+决策模型驱动的统一记忆编排插件(v0.3.8)。决策模型在每轮选择是否召回、查哪个后端、查多深、何时写入;程序只负责授权、能力校验、预算和审计。
+
+**架构一览：**
+
+```
+会话事件(message/checkpoint/turn_end)
+        │
+        ▼
+┌──────────────────────────────────────────────┐
+│ Orchestrator (src/core.mjs)                  │
+│  快照冻结 → 能力清单 → 决策模型 → 计划校验   │
+│  → 执行(去重/预算/中止) → 渲染注入            │
+└──────────────────────────────────────────────┘
+   │ 决策适配器              │ 后端适配器
+   ▼                        ▼
+┌──────────────┐   ┌──────────────────────────────┐
+│ SystemOne    │   │ hindsight   (HTTP, 固定 bank)│
+│ (类型化决策) │   │ memos-bridge (stdio JSON-RPC)│
+│ OpenAI 兼容  │   │ memos       (HTTP, 隔离实例) │
+└──────────────┘   └──────────────────────────────┘
+```
+
+## 快速开始
+
+```sh
+pnpm install        # 或 npm install
+npm test            # 143 项单元测试
+```
+
+作为 DSH 插件挂载见下文「安装」；独立集成可直接使用导出的
+`createOrchestrator` / `createSystemOneDecision` / `createHindsightBackend` 等
+工厂函数（见 `package.json` 的 `exports`）。
 
 ## 原则
 
@@ -31,11 +64,49 @@
 ## 检查与验收
 
 ```sh
-npm test                     # 67 项单元测试(全部通过)
+npm test                     # 143 项单元测试(全部通过)
 npm run check
+DSH_TEST_PROFILE=/root/.dsh/profiles/web/package.json node test/plugin-smoke.mjs
 node scripts/e2e-live.mjs    # 真机端到端:8/8 通过(决策/Hindsight 读写/MemOS bridge 读写/全链路)
 node scripts/bench-decision.mjs  # 决策模型基准
 ```
+
+## 目录结构
+
+```
+src/
+  plugin.mjs          入口：配置 schema、运行时组装、DSH 钩子注册
+  core.mjs            编排核心：快照/校验/去重/预算/渲染(零依赖)
+  adapters.mjs        SystemOne + OpenAI 兼容决策适配器；Hindsight/MemOS 后端
+  memos-bridge.mjs    MemOS 子进程 stdio JSON-RPC 适配器(turn 捕获)
+  memos-http.mjs      MemOS HTTP 搜索适配器(仅隔离实例)
+  host.mjs            DSH 生命周期适配(agent 钩子、回合捕获、dispose)
+  registry.mjs        绑定→后端实例注册表(权限过滤、描述符)
+  configuration.mjs   身份检测(cwd→仓库)、legacy 配置归一化
+  discovery.mjs       Hindsight bank 发现与创建
+  settings-rpc.mjs    浏览器配置页的受信 RPC(get/mutate/discover/create-bank)
+  tools.mjs           memory_retrieve / memory_remember 工具注册
+lib/client.js         浏览器端配置页(设置导航 + 插件面板)
+test/                 143 项单元测试 + 可选真机冒烟(plugin-smoke.mjs)
+scripts/              e2e-live / bench-decision / probe-memos-write
+cordis.patch.yml      生产绑定示例(/vol1/1000/code 工作区)
+GLOSSARY.md           术语表(memory system / library / scope 等)
+```
+
+## 源码导读（5 分钟版）
+
+1. **`core.mjs`** — 整个安全模型在这一个文件：`snapshot()` 冻结事件并校验形状；
+   `inventory()` 从**服务端绑定**推导能力清单（模型拿到的 backend/scope 都是不透明 id）；
+   `validate()` 把模型计划逐条对照能力清单，越权字段直接整体拒绝；
+   `perform()` 用 `Promise.race` 实现硬预算，写入先占去重槽再执行（超时绝不自动重试）；
+   `render()` 双重限长（单条 + 总包），注入永远是 `trust: untrusted` 的有界 JSON。
+2. **`adapters.mjs`** — `createSystemOneDecision` 把能力清单翻译成类型化问题
+   （recall_gate / retrieval_mode / scope_* / retention_gate），
+   并按「门控优先」合并答案；HTTP 后端全部拒绝模型控制的 bank/namespace 字段。
+3. **`plugin.mjs`** — 配置全部 `volatile()`：设置面板热改不重启；运行时按
+   身份（actorId/projectId/workspaceId）缓存实例，配置哈希变化时整体重建并 dispose。
+4. **`host.mjs`** — 每会话只「准入」一次（首个含用户消息的 step-1），随后按
+   `turn/end` 捕获回合文本；所有异步任务挂 `pending`，dispose 时 `allSettled` 等待收尾。
 
 E2E 实测(2026-10-10):决策 2.6s;Hindsight 项目/全局召回 1.4/3.3s;MemOS bridge 搜索 3.4s;Hindsight 写入→回流 ~10s;MemOS 回合捕获 11.6s;完整 orchestrator status=ok。
 
