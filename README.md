@@ -121,16 +121,67 @@ E2E 实测(2026-10-10):决策 2.6s;Hindsight 项目/全局召回 1.4/3.3s;MemOS 
 
 回环访问使用宿主 `configForms`；受信任的远程访问使用专用、鉴权的 MemoryPilot connection RPC，并保留 revision fencing 和服务端字段白名单。设置导航会立即注册，不再受配置 namespace 的服务时序影响。
 
-## 安装(已完成于本 profile)
+## 安装（DSH 插件）
+
+### 方式一：从 GitHub 直接安装（推荐）
+
+在目标机器上确认已认证 GitHub（`gh auth login`）或已配置 git 凭据，然后：
 
 ```sh
-npm pack
-cd /root/.dsh/profiles/web && pnpm add file:/vol1/1000/code/dsh-memory-pilot/dsh-memory-pilot-0.2.0.tgz
-# package.json 的 dsh.profile.bundles 加入 "dsh-memory-pilot"
-# 重启 DSH web 生效(dsh-bridge 辅助进程托管,约 3-7s)
+# 1. 把插件装入 DSH web profile
+cd /root/.dsh/profiles/web
+pnpm add github:youluo1230/dsh-memory-pilot
+
+# 2. 在 profile 的 package.json 里把 "dsh-memory-pilot" 加入 dsh.profile.bundles
+#    (若已存在 dsh.profile.bundles 数组则追加)
+
+# 3. 重启 DSH web 生效（dsh-bridge 辅助进程托管，约 3-7s）
 ```
 
-验证插件可加载:`import('dsh-memory-pilot/plugin')` 并 `apply()`——生产配置已离线验证通过(4 个钩子注册,无网络调用)。
+也可以锁定版本（推荐，便于回退）：
+
+```sh
+pnpm add github:youluo1230/dsh-memory-pilot#v0.3.8
+```
+
+### 方式二：本地 tgz 安装
+
+```sh
+git clone https://github.com/youluo1230/dsh-memory-pilot.git
+cd dsh-memory-pilot && npm pack
+cd /root/.dsh/profiles/web && pnpm add file:/path/to/dsh-memory-pilot-0.3.8.tgz
+# 同样把 "dsh-memory-pilot" 加入 dsh.profile.bundles 后重启
+```
+
+### 安装后配置（三选一）
+
+1. **配置面板**（推荐）：重启后打开 DSH Web → 设置 → 左侧导航「MemoryPilot 记忆调度」，按「决策模型 / 记忆系统 / 使用范围 / 高级设置」四个页签填写；改动即时生效（全 volatile，无需重启）。
+2. **cordis patch**：参考 [`examples/cordis-patch-minimal.yml`](examples/cordis-patch-minimal.yml) 或本仓库 [`cordis.patch.yml`](cordis.patch.yml)（生产实例）追加到 profile 的 `cordis.patch.yml`。
+3. **首次启动即生效**：patch 中 `enabled: true` + 完整绑定，重启后自动装配（本机生产即此形态）。
+
+### 最低要求
+
+- Node.js ≥ 18（开发环境 Node 25）
+- 一个决策模型端点：SystemOne 类型化接口（`POST /v1/systemone`）或 OpenAI 兼容 `POST /v1/chat/completions`（JSON mode）
+- 至少一个记忆后端：Hindsight（`http(s)://host:8889`）、MemOS bridge（本机 Hermes memos 插件目录）或 MemOS 隔离实例
+- 决策模型 API key 通过环境变量注入（`decisionKeyEnv`），**不要**写进配置文件
+
+### 验证安装
+
+```sh
+# 插件可加载且钩子注册成功（无需网络）：
+DSH_TEST_PROFILE=/root/.dsh/profiles/web/package.json node test/plugin-smoke.mjs
+# 或在 DSH 日志中观察 MemoryPilot 审计记录：
+#   MemoryPilot {"phase":"decision","status":"started",...}
+```
+
+### 卸载 / 回退
+
+```sh
+cd /root/.dsh/profiles/web
+pnpm remove dsh-memory-pilot
+# 并从 package.json 的 dsh.profile.bundles 移除该名称，重启 DSH。
+```
 
 ## 切换与回退
 

@@ -1,0 +1,40 @@
+# Minimal MemoryPilot binding example.
+# Append to the DSH profile cordis.patch.yml (or merge via the patch loader),
+# then restart the DSH web process.
+#
+# Requirements:
+#   - decision model: any endpoint answering POST /v1/systemone (SystemOne
+#     typed decision) or POST /v1/chat/completions with JSON mode (openai
+#     protocol). Point decisionBaseUrl at the API ROOT, not /chat/completions.
+#   - at least one memory backend (hindsight / memos-bridge / memos).
+- insert:
+    - id: dsh-memory-pilot
+      name: dsh-memory-pilot
+      config:
+        enabled: true
+        actorId: your-actor-id          # personal scope identity
+        decisionProtocol: systemone     # or: openai
+        decisionBaseUrl: http://your-gateway:8009/v1
+        decisionModel: your-model
+        decisionKeyEnv: MEMORY_DECISION_API_KEY  # env var name; key never in this file
+        budgetMs: 9000                  # interactive retrieval budget
+        captureBudgetMs: 60000          # background turn-capture budget
+        backends:
+          # Project scope -> Hindsight bank derived per repository.
+          - id: hs-repository
+            type: hindsight
+            baseUrl: http://localhost:8889
+            bank: coding-agent::{project}   # {project} expands to repo id
+            scope: project
+            scopeId: '*'                    # any repository identity
+            read: true
+            write: true
+          # Global scope -> MemOS shared store via stdio bridge (turn capture).
+          # - id: memos-global
+          #   type: memos-bridge
+          #   home: /root/.hermes/memos-plugin
+          #   agent: deepseek-harness
+          #   scope: global
+          #   scopeId: global
+          #   read: true
+          #   write: true
