@@ -34,22 +34,25 @@ export async function testDecisionConnection(config = {}, { fetchImpl = globalTh
   const createDecision = config.decisionProtocol === 'openai' ? createOpenAICompatibleDecision : createSystemOneDecision;
   const decision = createDecision({ baseUrl, model, apiKey, fetchImpl, timeoutMs });
   const startedAt = Date.now();
+  // Adapters deliberately hide dependency errors; wrap so the UI shows what
+  // to fix (endpoint unreachable / malformed) instead of a bare adapter line.
+  const probe = (kind, event, capabilities) => decision.decide({ event, capabilities }, {}).catch(error => {
+    fail(`决策接口不可达或无响应（${kind}协议）：${error instanceof Error ? error.message : 'unknown'}`);
+  });
   // SystemOne answers typed questions; a minimal single-question state is the
   // cheapest possible round trip that still exercises the real protocol.
   if (config.decisionProtocol === 'openai') {
     // OpenAI-compatible probes go through decide() with an empty capability
     // list; a healthy endpoint returns {"actions":[]}.
-    const result = await withTimeout(decision.decide({
-      event: { type: 'message', id: 'settings-test', sessionId: 'settings-test', text: 'connection test' },
-      capabilities: [],
-    }, {}), timeoutMs, '决策接口');
+    const result = await withTimeout(
+      probe('openai', { type: 'message', id: 'settings-test', sessionId: 'settings-test', text: 'connection test' }, []),
+      timeoutMs, '决策接口');
     if (!result || typeof result !== 'object' || !Array.isArray(result.actions)) fail('决策接口返回了意外格式');
     return { ok: true, protocol: 'openai', model, durationMs: Date.now() - startedAt, detail: `连接正常（协议 openai，模型 ${model}，${Date.now() - startedAt} ms）` };
   }
-  const result = await withTimeout(decision.decide({
-    event: { type: 'checkpoint', id: 'settings-test', sessionId: 'settings-test', text: 'connection test' },
-    capabilities: [],
-  }, {}), timeoutMs, '决策接口');
+  const result = await withTimeout(
+    probe('SystemOne', { type: 'checkpoint', id: 'settings-test', sessionId: 'settings-test', text: 'connection test' }, []),
+    timeoutMs, '决策接口');
   if (!result || typeof result !== 'object' || !Array.isArray(result.actions)) fail('决策接口返回了意外格式');
   return { ok: true, protocol: 'systemone', model, durationMs: Date.now() - startedAt, detail: `连接正常（协议 SystemOne，模型 ${model}，${Date.now() - startedAt} ms）` };
 }
@@ -102,18 +105,23 @@ export async function testSystemConnection(item = {}, { fetchImpl = globalThis.f
   }
   if (type === 'memos-bridge') {
     const { createMemosBridgeBackend } = await import('./memos-bridge.mjs');
-    const home = clean(item.home) || undefined;
+    const home = clean(item.home);
     if (!home) fail('MemOS bridge 需要配置插件 home 路径');
     const backend = createMemosBridgeBackend({
       home, agent: clean(item.agent) || 'deepseek-harness',
-      scope: item.scope || 'global', scopeId: item.scopeId || 'global',
+      scope: item.scope === 'global' ? 'global' : 'project',
+      scopeId: item.scope === 'global' ? 'global' : 'connection-test',
       readyTimeoutMs: timeoutMs, requestTimeoutMs: Math.min(timeoutMs, 8000),
-      spawnImpl: undefined,
     });
-    // createMemosBridgeBackend spawns lazily; health check via ready().
+    // Search is the runtime's own read path; a hit-less result is still a
+    // healthy bridge. Dispose always kills the spawned subprocess.
     try {
-      await withTimeout(backend.__probeHealth ? backend.__probeHealth() : Promise.resolve(), timeoutMs, 'MemOS bridge');
-    } catch { fail('MemOS bridge 子进程无法启动或无响应'); }
+      await withTimeout(backend.execute({ operation: 'search', scope: backend.scope, scopeId: backend.scopeId, query: 'memory-pilot connection test' }, {}), timeoutMs, 'MemOS bridge');
+    } catch (error) {
+      await backend.dispose?.();
+      fail(`MemOS bridge 无响应（${error instanceof Error ? error.message : 'unknown'}）`);
+    }
+    await backend.dispose?.();
     const durationMs = Date.now() - startedAt;
     return { ok: true, type, name, durationMs, detail: `MemOS bridge 连接正常（${durationMs} ms）` };
   }

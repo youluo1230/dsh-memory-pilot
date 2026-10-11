@@ -6,6 +6,7 @@ import { createOpenAICompatibleDecision, createSystemOneDecision } from './adapt
 import { createRegistry } from './registry.mjs';
 import { attachHost } from './host.mjs';
 import { installSettingsRpc } from './settings-rpc.mjs';
+import { testDecisionConnection, testSystemConnection } from './connection-test.mjs';
 import { registerMemoryTools } from './tools.mjs';
 
 const debug = line => { if (process.env.MEMORY_PILOT_DEBUG) console.error(`[memory-pilot] ${line}`); };
@@ -120,7 +121,15 @@ export function apply(ctx, config) {
       ? ctx.workspaceRegistry.list()[0]?.path : initial.workspacePath;
     if (firstPath) runtimeFor({ header: { cwd: firstPath } }); // preserve fail-fast configuration
   }
-  const disposeSettingsRpc = installSettingsRpc(ctx, { getConfig: current });
+  const disposeSettingsRpc = installSettingsRpc(ctx, {
+    getConfig: current,
+    // One-shot probes for the settings UI "测试" buttons. They receive the
+    // DRAFT (possibly unsaved) config and must not touch runtimes or state.
+    testConnection: async ({ kind, config }, { signal } = {}) => {
+      if (kind === 'decision') return testDecisionConnection(config, { signal, timeoutMs: 10_000 });
+      return testSystemConnection(config, { signal, timeoutMs: 10_000 });
+    },
+  });
   const acceptsSession = session => {
     const resolved = prepared();
     if (resolved.enabled !== true || typeof session.header?.cwd !== 'string') return false;
