@@ -27,7 +27,7 @@ npm test            # 144 项单元测试
 | 类型 | 传输 | 能力 | 说明 |
 |---|---|---|---|
 | `hindsight` | HTTP(固定 bank) | search / deep / write | write 为异步 retain,受理≠提取完成 |
-| `memos-bridge` | 子进程 stdio JSON-RPC | search / write | write 为 `turn.start`+`turn.end` 回合捕获,后台归纳;搜索结果按设计含 hub 共享内容 |
+| [`memos-bridge`](https://github.com/MemTensor/MemOS/tree/main/apps/memos-local-plugin)（`@memtensor/memos-local-plugin` 自带） | 子进程 stdio JSON-RPC | search / write | write 为 `turn.start`+`turn.end` 回合捕获,后台归纳;搜索结果按设计含 hub 共享内容 |
 | `memos` | HTTP `/api/v1/memory/search` | search | 仅限真正隔离实例;viewer 密码模式下不可用(当前部署未用) |
 
 ## 工作原理
@@ -148,9 +148,11 @@ profile 的 `package.json` 依赖。
 - Node.js ≥ 18
 - 一个决策模型端点：SystemOne 类型化接口（`POST /v1/systemone`）或
   OpenAI 兼容 `POST /v1/chat/completions`（JSON mode）
-- 至少一个记忆后端：Hindsight（HTTP）、MemOS bridge（宿主上有
-  [memos-plugin](https://github.com/youluo1230/dsh-memory-pilot) 机器接口）
-  或 MemOS 隔离实例
+- 至少一个记忆后端：
+  [Hindsight](https://github.com/vectorize-io/hindsight)（HTTP 服务）、
+  [MemOS memos-local-plugin](https://github.com/MemTensor/MemOS/tree/main/apps/memos-local-plugin)
+  （一键装进 DSH：`curl -fsSL https://raw.githubusercontent.com/MemTensor/MemOS/main/apps/memos-local-plugin/install.sh | bash -s -- --agent dsh --profile web`）
+  或 MemOS 隔离 HTTP 实例
 - 决策模型 API key 通过环境变量注入（`decisionKeyEnv`），**不要**写进配置文件
 
 ### 卸载 / 回退
