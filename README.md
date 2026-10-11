@@ -169,3 +169,31 @@ dsh plugin --profile web remove dsh-memory-pilot
 - 幂等仅进程内;持久化 outbox、冲突合并、跨后端事务未实现。
 - SystemOne 是类型化决策模型，不生成任意文本；MemoryPilot 只让它在程序生成的已授权召回/写入候选中选择。
 - `workspacePath` 是包含其子目录的工作区根；仓库身份从会话真实 `cwd` 独立识别，两者互不干扰。
+
+## 常见问题
+
+### 安装时报 `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION` / "Lockfile failed supply-chain policy check"
+
+pnpm ≥11 对锁文件整体执行「发布冷却期」校验（默认 1440 分钟 = 1 天）：任何
+依赖在锁文件中解析到的版本若发布不足一天，整个安装都会被拒绝——即使本次
+改动与该包无关。DSH profile 通常通过插件市场装了很多包，其中某个刚发版的
+依赖（例如某天刚发布的 `dshmarket`）会挡住**所有**后续插件操作。
+
+解决（任选其一）：
+
+```sh
+# 方式一：单次放行（推荐，事后自动失效）
+dsh plugin --profile web add github:youluo1230/dsh-memory-pilot \
+  --config.minimum-release-age=0
+
+# 方式二：把该包加入冷却期豁免（pnpm-workspace.yaml / 全局 config.yaml）
+#   minimumReleaseAgeExclude:
+#   - dshmarket
+
+# 方式三：直接指定一个成熟版本安装
+dsh plugin --profile web add github:youluo1230/dsh-memory-pilot#v0.3.8
+```
+
+注意：方式一只影响本次命令；若 profile 锁文件里还有其他「太新」的依赖，
+可能需要逐个排除或临时把 `minimumReleaseAge` 设为 0 装完再恢复。
+
