@@ -1,6 +1,6 @@
 # MemoryPilot — 智能记忆调度
 
-[![tests](https://img.shields.io/badge/tests-143%20passing-brightgreen)]() [![node](https://img.shields.io/badge/node-%E2%89%A518-blue)]()
+[![tests](https://img.shields.io/badge/tests-144%20passing-brightgreen)]() [![node](https://img.shields.io/badge/node-%E2%89%A518-blue)]()
 
 决策模型驱动的统一记忆编排插件(v0.3.8)。决策模型在每轮选择是否召回、查哪个后端、查多深、何时写入;程序只负责授权、能力校验、预算和审计。
 
