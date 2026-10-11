@@ -1,0 +1,44 @@
+# EXAMPLE — a real production binding from the author's LAN (192.168.1.x,
+# local model names, local paths). Copy and adapt to your own environment;
+# do NOT apply it verbatim: the addresses, bank names and home paths below
+# reflect one specific deployment.
+#
+# Composition (per-level memory systems, all operator-authorized):
+#   project (/vol1/1000/code) → Hindsight bank `coding-agent::code`  (read+write, existing bank)
+#                             → MemOS shared store via bridge stdio  (read+write, turn capture)
+#   global                    → Hindsight bank `hermes`             (read-only, Hermes long-term memory)
+#
+# The decision model is agnes-3.0-flash on the LAN gateway; its API key is read
+# from the DSH process environment (CUSTOM_PROVIDER_NEW_API_KEY), never stored here.
+# No secret material appears in this file.
+- insert:
+    - id: dsh-memory-pilot
+      name: dsh-memory-pilot
+      config:
+        enabled: true
+        workspacePath: /vol1/1000/code
+        projectId: ''
+        actorId: ''
+        decisionProtocol: systemone
+        decisionBaseUrl: http://192.168.1.84:8009/v1
+        decisionModel: clef-flash
+        decisionKeyEnv: ''
+        budgetMs: 9000
+        captureBudgetMs: 60000
+        backends:
+          - id: memos-global
+            type: memos-bridge
+            home: /root/.hermes/memos-plugin
+            agent: deepseek-harness
+            scope: global
+            scopeId: global
+            read: true
+            write: true
+          - id: hs-repository
+            type: hindsight
+            baseUrl: http://localhost:8889
+            bank: coding-agent::{project}
+            scope: project
+            scopeId: '*'
+            read: true
+            write: true

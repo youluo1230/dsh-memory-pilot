@@ -3,7 +3,7 @@
 // adapter uses. No HTTP, no viewer password, no shared-cookie lifetime
 // problems. The child owns the store; this process never opens the DB.
 //
-// Verified against /root/.hermes/memos-plugin:
+// Verified against an installed @memtensor/memos-local-plugin home (~/.hermes/memos-plugin):
 //   bridge/methods.ts dispatcher, agent-contract/jsonrpc.ts RPC_METHODS,
 //   agent-contract/dto.ts RetrievalResultDTO / TurnInputDTO / TurnResultDTO,
 //   dist/bridge.mjs parseArgs (--no-viewer, --home=).

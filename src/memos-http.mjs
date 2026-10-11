@@ -1,4 +1,4 @@
-// Verified against /root/.hermes/memos-plugin/{server,dist/server}:
+// Verified against an installed @memtensor/memos-local-plugin ({server,dist/server}):
 // routes/memory.{ts,js}, middleware/auth.{ts,js}, routes/auth.{ts,js}, http.{ts,js}.
 const SCOPES = new Set(['personal', 'global', 'project', 'workspace']);
 const ACTION_KEYS = new Set(['operation', 'backend', 'scope', 'scopeId', 'query']);

@@ -143,6 +143,10 @@ profile 的 `package.json` 依赖。
 2. 也可以在 profile 的 `cordis.patch.yml` 中预置绑定，参考
    [`examples/cordis-patch-minimal.yml`](examples/cordis-patch-minimal.yml)。
 
+> 包内自带的 `cordis.patch.yml` 只注册 `enabled: false` 的空白默认值，
+> 不含任何端点、模型或后端绑定；示例见
+> [`examples/`](examples/)（最小模板与一份真实生产绑定）。
+
 ### 最低要求
 
 - Node.js ≥ 18

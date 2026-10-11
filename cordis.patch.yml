@@ -1,41 +1,29 @@
-# MemoryPilot — production binding for the /vol1/1000/code workspace.
+# MemoryPilot default bundle patch — ships with the package and is applied
+# automatically when this plugin is listed in dsh.profile.bundles.
 #
-# Composition (per-level memory systems, all operator-authorized):
-#   project (/vol1/1000/code) → Hindsight bank `coding-agent::code`  (read+write, existing bank)
-#                             → MemOS shared store via bridge stdio  (read+write, turn capture)
-#   global                    → Hindsight bank `hermes`             (read-only, Hermes long-term memory)
+# It registers the plugin with SAFE, GENERIC defaults:
+#   - enabled: false        (turn it on in the settings UI or in your own
+#                            cordis.patch.yml after configuring a decision
+#                            model and at least one memory backend)
+#   - no identities, no gateway URLs, no model names, no backend bindings
 #
-# The decision model is agnes-3.0-flash on the LAN gateway; its API key is read
-# from the DSH process environment (CUSTOM_PROVIDER_NEW_API_KEY), never stored here.
-# No secret material appears in this file.
+# Nothing here is machine-specific. Your local values (decision endpoint,
+# model, backends) go through the MemoryPilot settings panel or your own
+# profile patch layer, NOT this file. See examples/cordis-patch-minimal.yml
+# for a ready-to-extend binding template.
 - insert:
     - id: dsh-memory-pilot
       name: dsh-memory-pilot
       config:
-        enabled: true
-        workspacePath: /vol1/1000/code
-        projectId: ''
+        enabled: false
         actorId: ''
+        projectId: ''
+        workspaceId: ''
+        workspacePath: ''
         decisionProtocol: systemone
-        decisionBaseUrl: http://192.168.1.84:8009/v1
-        decisionModel: clef-flash
-        decisionKeyEnv: ''
+        decisionBaseUrl: ''
+        decisionModel: ''
+        decisionKeyEnv: MEMORY_DECISION_API_KEY
         budgetMs: 9000
         captureBudgetMs: 60000
-        backends:
-          - id: memos-global
-            type: memos-bridge
-            home: /root/.hermes/memos-plugin
-            agent: deepseek-harness
-            scope: global
-            scopeId: global
-            read: true
-            write: true
-          - id: hs-repository
-            type: hindsight
-            baseUrl: http://localhost:8889
-            bank: coding-agent::{project}
-            scope: project
-            scopeId: '*'
-            read: true
-            write: true
+        backends: []
