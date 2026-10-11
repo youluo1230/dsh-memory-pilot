@@ -1,203 +1,292 @@
-# MemoryPilot — 智能记忆调度
+# MemoryPilot
 
-[![tests](https://img.shields.io/badge/tests-144%20passing-brightgreen)]() [![node](https://img.shields.io/badge/node-%E2%89%A518-blue)]()
+> 面向 DeepSeek Harness 的决策驱动型记忆编排插件。
 
-决策模型驱动的统一记忆编排插件(v0.3.8)。决策模型在每轮选择是否召回、查哪个后端、查多深、何时写入;程序只负责授权、能力校验、预算和审计。
+MemoryPilot 在每轮会话中判断**是否需要跨会话记忆、应查询哪些作用域、采用普通召回还是深度回顾，以及哪些内容值得长期保存**。决策模型只在服务端提供的已授权候选中做选择；后端地址、存储分区和身份边界始终由程序控制。
 
-**架构一览：**
+当前版本：`0.3.8`
 
-pnpm install        # 或 npm install
-npm test            # 144 项单元测试
-```
+## 核心能力
 
-作为 DSH 插件挂载见下文「安装」；独立集成可直接使用导出的
-`createOrchestrator` / `createSystemOneDecision` / `createHindsightBackend` 等
-工厂函数（见 `package.json` 的 `exports`）。
-
-## 原则
-
-- 模型生成读写行动计划,程序只做授权、能力校验、执行预算和审计。
-- backend 与 scope 分开:personal、global、project、workspace。scopeId 由服务端从身份推导,模型不能选择任意 bank、namespace 或 URL。
-- 默认拒绝:只有配置里显式授权的绑定才出现在决策输入中;读写权限按绑定独立。
-- 决策失败、超时或计划非法时静默跳过(noop/timeout),不影响回合。
-- 注入文本是带 `trust: untrusted` 标记的有界 JSON,绝不当作权威。
-
-## 后端
-
-| 类型 | 传输 | 能力 | 说明 |
-|---|---|---|---|
-| `hindsight` | HTTP(固定 bank) | search / deep / write | write 为异步 retain,受理≠提取完成 |
-| [`memos-bridge`](https://github.com/MemTensor/MemOS/tree/main/apps/memos-local-plugin)（`@memtensor/memos-local-plugin` 自带） | 子进程 stdio JSON-RPC | search / write | write 为 `turn.start`+`turn.end` 回合捕获,后台归纳;搜索结果按设计含 hub 共享内容 |
-| `memos` | HTTP `/api/v1/memory/search` | search | 仅限真正隔离实例;viewer 密码模式下不可用(当前部署未用) |
+- **按需召回**：只有当前请求确实依赖历史信息时才查询记忆，避免无意义的上下文注入。
+- **分层作用域**：支持全局、工作区、仓库和个人作用域，并由服务端解析实际身份。
+- **两种检索模式**：`recall` 用于低延迟事实召回，`reflect` 用于跨历史记录的深度综合。
+- **受控写入**：仅保留明确、稳定且未来仍有价值的偏好、决策、约束、里程碑和可复用结论。
+- **多后端编排**：支持 Hindsight、MemOS 本地桥接和隔离的 MemOS HTTP 实例。
+- **可视化配置**：在 DSH Web 中管理决策模型、记忆系统、作用范围和高级参数。
+- **显式工具**：向 Agent 注册 `memory_retrieve` 与 `memory_remember`，支持主动查询和保留记忆。
+- **安全失败**：决策超时、响应非法或后端不可用时，本轮记忆操作会被跳过，不阻塞正常对话。
 
 ## 工作原理
 
-```
-会话事件(message/checkpoint/turn_end)
-        │
-        ▼
-┌──────────────────────────────────────────────┐
-│ Orchestrator (src/core.mjs)                  │
-│  快照冻结 → 能力清单 → 决策模型 → 计划校验   │
-│  → 执行(去重/预算/中止) → 渲染注入           │
-└──────────────────────────────────────────────┘
-   │ 决策适配器              │ 后端适配器
-   ▼                        ▼
-┌──────────────┐   ┌──────────────────────────────┐
-│ SystemOne    │   │ hindsight   (HTTP, 固定 bank)│
-│ (类型化决策) │   │ memos-bridge (stdio JSON-RPC)│
-│ OpenAI 兼容  │   │ memos       (HTTP, 隔离实例) │
-└──────────────┘   └──────────────────────────────┘
+```text
+会话事件（message / checkpoint / turn_end）
+                    │
+                    ▼
+┌─────────────────────────────────────────────────────┐
+│ MemoryPilot Orchestrator                            │
+│                                                     │
+│ 事件快照 → 能力清单 → 决策模型 → 计划校验          │
+│          → 预算控制与执行 → 安全渲染与审计          │
+└─────────────────────────────────────────────────────┘
+          │                              │
+          ▼                              ▼
+┌─────────────────────┐       ┌────────────────────────┐
+│ 决策适配器           │       │ 记忆后端               │
+│                     │       │                        │
+│ SystemOne 类型化决策 │       │ Hindsight              │
+│ OpenAI 兼容 JSON     │       │ MemOS stdio bridge     │
+└─────────────────────┘       │ MemOS HTTP             │
+                              └────────────────────────┘
 ```
 
-## 开发与测试
+MemoryPilot 将“做什么”和“允许做什么”分开处理：
+
+1. 程序根据当前会话身份和配置生成能力清单。
+2. 决策模型只能从清单中选择召回或写入动作。
+3. 编排器再次校验每个动作的后端、作用域、权限和证据。
+4. 合法动作在时间预算内执行；召回结果经过限长后以不可信上下文注入。
+5. 执行结果写入审计轨迹，供排查和观测使用。
+
+## 支持的记忆后端
+
+| 后端类型 | 传输方式 | 能力 | 适用场景 |
+| --- | --- | --- | --- |
+| [`hindsight`](https://github.com/vectorize-io/hindsight) | HTTP，绑定固定 bank | `search` / `deep` / `write` | 仓库或工作区级记忆；支持普通召回、深度回顾和异步写入 |
+| [`memos-bridge`](https://github.com/MemTensor/MemOS/tree/main/apps/memos-local-plugin) | stdio JSON-RPC | `search` / `write` | 通过 `@memtensor/memos-local-plugin` 捕获完整回合并在后台归纳 |
+| `memos` | HTTP | `search` | 连接真正隔离的 MemOS 实例；当前不提供通用写入契约 |
+
+> Hindsight 和 MemOS 的写入均可能包含异步处理。“已受理”不代表内容已经完成提取，也不保证能够立即检索到。
+
+## 系统要求
+
+- Node.js `>= 22`
+- 已安装并至少启动过一次的 DeepSeek Harness Web profile
+- 与本插件 peer dependency 范围兼容的 DSH 版本
+- 一个决策模型端点：
+  - SystemOne：`POST /v1/systemone`
+  - OpenAI 兼容接口：`POST /v1/chat/completions`，并支持 JSON mode
+- 至少一个受支持的记忆后端
+
+如需使用 `memos-bridge`，可按 MemOS 官方脚本安装本地插件：
 
 ```sh
-pnpm install
-npm test                     # 144 项单元测试
-npm run check
+curl -fsSL https://raw.githubusercontent.com/MemTensor/MemOS/main/apps/memos-local-plugin/install.sh \
+  | bash -s -- --agent dsh --profile web
 ```
 
-完整冒烟与真机端到端（`test/plugin-smoke.mjs`、`scripts/e2e-live.mjs`）需要已安装的 DSH 宿主环境，见脚本头部注释。
+执行远程安装脚本前，请先审阅脚本内容并确认来源可信。
 
-## 目录结构
+## 安装
 
-```
-src/
-  plugin.mjs          入口：配置 schema、运行时组装、DSH 钩子注册
-  core.mjs            编排核心：快照/校验/去重/预算/渲染(零依赖)
-  adapters.mjs        SystemOne + OpenAI 兼容决策适配器；Hindsight/MemOS 后端
-  memos-bridge.mjs    MemOS 子进程 stdio JSON-RPC 适配器(turn 捕获)
-  memos-http.mjs      MemOS HTTP 搜索适配器(仅隔离实例)
-  host.mjs            DSH 生命周期适配(agent 钩子、回合捕获、dispose)
-  registry.mjs        绑定→后端实例注册表(权限过滤、描述符)
-  configuration.mjs   身份检测(cwd→仓库)、legacy 配置归一化
-  discovery.mjs       Hindsight bank 发现与创建
-  settings-rpc.mjs    浏览器配置页的受信 RPC(get/mutate/discover/create-bank)
-  tools.mjs           memory_retrieve / memory_remember 工具注册
-lib/client.js         浏览器端配置页(设置导航 + 插件面板)
-test/                 144 项单元测试 + 可选真机冒烟(plugin-smoke.mjs)
-scripts/              e2e-live / bench-decision / probe-memos-write
-cordis.patch.yml      随包分发的 bundle patch(声明插件加载入口)
-examples/             cordis-patch-minimal.yml 最小绑定示例
-GLOSSARY.md           术语表(memory system / library / scope 等)
-```
-
-## 源码导读（5 分钟版）
-
-1. **`core.mjs`** — 整个安全模型在这一个文件：`snapshot()` 冻结事件并校验形状；
-   `inventory()` 从**服务端绑定**推导能力清单（模型拿到的 backend/scope 都是不透明 id）；
-   `validate()` 把模型计划逐条对照能力清单，越权字段直接整体拒绝；
-   `perform()` 用 `Promise.race` 实现硬预算，写入先占去重槽再执行（超时绝不自动重试）；
-   `render()` 双重限长（单条 + 总包），注入永远是 `trust: untrusted` 的有界 JSON。
-2. **`adapters.mjs`** — `createSystemOneDecision` 把能力清单翻译成类型化问题
-   （recall_gate / retrieval_mode / scope_* / retention_gate），
-   并按「门控优先」合并答案；HTTP 后端全部拒绝模型控制的 bank/namespace 字段。
-3. **`plugin.mjs`** — 配置全部 `volatile()`：设置面板热改不重启；运行时按
-   身份（actorId/projectId/workspaceId）缓存实例，配置哈希变化时整体重建并 dispose。
-4. **`host.mjs`** — 每会话只「准入」一次（首个含用户消息的 step-1），随后按
-   `turn/end` 捕获回合文本；所有异步任务挂 `pending`，dispose 时 `allSettled` 等待收尾。
-
-## 配置面板
-
-浏览器端配置页随包分发（`lib/client.js`、`dsh.client` 声明），挂在两处：
-
-- **设置 → 左侧导航「MemoryPilot 记忆调度」**：按任务分成「决策模型 / 记忆系统 / 使用范围 / 高级设置」四个页签。
-- **侧栏「插件」→ dsh-memory-pilot 行的「配置」按钮**：打开同一配置页。
-
-记忆系统与作用范围分开管理：系统卡片只显示连接摘要，连接细节在编辑弹窗中维护。使用范围页以可筛选表格展示全局、工作区和仓库绑定，包括范围标识、记忆系统、bank、读写权限及编辑/删除操作。普通界面不暴露 `scopeId`。工作区是管理范围，Git 仓库是记忆隔离范围；默认从会话 `cwd` 自动识别，只有需要时才填写 override。
-
-回环访问使用宿主 `configForms`；受信任的远程访问使用专用、鉴权的 MemoryPilot connection RPC，并保留 revision fencing 和服务端字段白名单。设置导航会立即注册，不再受配置 namespace 的服务时序影响。
-
-## 安装（DSH 插件）
-
-> 前置条件：已安装 DSH（`@deepseek-ai/dsh`）并至少启动过一次 `dsh web`，
-> 使 `web` profile 完成初始化。插件版本需与 `dsh --version` 显示的 peer
-> 范围兼容。
-
-### 安装
+### 1. 安装插件
 
 ```sh
 dsh plugin --profile web add github:youluo1230/dsh-memory-pilot
-# 或锁定版本：
+```
+
+如需锁定当前版本：
+
+```sh
 dsh plugin --profile web add github:youluo1230/dsh-memory-pilot#v0.3.8
 ```
 
-`dsh plugin` 会在 profile 目录内转发给 pnpm 完成安装，并把插件写入
-profile 的 `package.json` 依赖。
+### 2. 启用插件
 
-### 启用
+在 Web profile 的 `package.json` 中，将插件加入 `dsh.profile.bundles`：
 
-在 profile 的 `dsh.profile.bundles` 中加入 `"dsh-memory-pilot"`
-（编辑 profile 目录下的 `package.json`）。随后：
-
-- 若 profile 启用了配置热重载（`patchReload: "live"`），改动会自动重载；
-- 否则重启 DSH web 生效。
-
-### 配置
-
-安装并启用后打开 DSH Web：
-
-1. **设置 → 左侧导航「MemoryPilot 记忆调度」**：按「决策模型 / 记忆系统 /
-   使用范围 / 高级设置」四个页签填写；改动即时生效（配置全 volatile，无需重启）。
-2. 也可以在 profile 的 `cordis.patch.yml` 中预置绑定，参考
-   [`examples/cordis-patch-minimal.yml`](examples/cordis-patch-minimal.yml)。
-
-> 包内自带的 `cordis.patch.yml` 只注册 `enabled: false` 的空白默认值，
-> 不含任何端点、模型或后端绑定；示例见
-> [`examples/`](examples/)（最小模板与一份真实生产绑定）。
-
-### 最低要求
-
-- Node.js ≥ 18
-- 一个决策模型端点：SystemOne 类型化接口（`POST /v1/systemone`）或
-  OpenAI 兼容 `POST /v1/chat/completions`（JSON mode）
-- 至少一个记忆后端：
-  [Hindsight](https://github.com/vectorize-io/hindsight)（HTTP 服务）、
-  [MemOS memos-local-plugin](https://github.com/MemTensor/MemOS/tree/main/apps/memos-local-plugin)
-  （一键装进 DSH：`curl -fsSL https://raw.githubusercontent.com/MemTensor/MemOS/main/apps/memos-local-plugin/install.sh | bash -s -- --agent dsh --profile web`）
-  或 MemOS 隔离 HTTP 实例
-- 决策模型 API key 通过环境变量注入（`decisionKeyEnv`），**不要**写进配置文件
-
-### 卸载 / 回退
-
-```sh
-dsh plugin --profile web remove dsh-memory-pilot
-# 并从 dsh.profile.bundles 移除该名称，重启 DSH。
+```json
+{
+  "dsh": {
+    "profile": {
+      "bundles": ["dsh-memory-pilot"]
+    }
+  }
+}
 ```
 
-## 限制
+如果 profile 启用了 `patchReload: "live"`，配置会自动重载；否则请重启 DSH Web。
 
-- 决策模型不可用(网关 503 等)时该轮无召回,不兜底;网关波动已实测存在。
-- 写入是异步的:Hindsight 需提取、MemOS 需后台归纳,写入成功≠立即可检索。
-- 幂等仅进程内;持久化 outbox、冲突合并、跨后端事务未实现。
-- SystemOne 是类型化决策模型，不生成任意文本；MemoryPilot 只让它在程序生成的已授权召回/写入候选中选择。
-- `workspacePath` 是包含其子目录的工作区根；仓库身份从会话真实 `cwd` 独立识别，两者互不干扰。
+### 3. 完成配置
+
+打开 DSH Web，进入：
+
+**设置 → 记忆调度（MemoryPilot）**
+
+依次配置以下内容：
+
+1. **决策模型**：协议、API 根地址、模型名称和密钥环境变量名。
+2. **记忆系统**：添加 Hindsight 或 MemOS 连接，并测试连通性。
+3. **使用范围**：为全局、工作区或仓库绑定记忆系统和存储分区。
+4. **高级设置**：按需调整交互检索与后台捕获的时间预算。
+5. 确认配置后启用 MemoryPilot。
+
+所有可编辑字段均支持热更新，通常不需要重启插件。
+
+也可以通过 profile 的 `cordis.patch.yml` 预置配置。最小模板见 [`examples/cordis-patch-minimal.yml`](examples/cordis-patch-minimal.yml)。包内自带的 [`cordis.patch.yml`](cordis.patch.yml) 只注册禁用状态的安全默认值，不包含端点、凭据或后端绑定。
+
+## 凭据配置
+
+决策模型密钥应通过环境变量提供：
+
+```sh
+export MEMORY_DECISION_API_KEY="your-api-key"
+```
+
+随后将 `decisionKeyEnv` 配置为环境变量名 `MEMORY_DECISION_API_KEY`。
+
+后端密钥也应优先通过对应的 `keyEnv` 或 `cookieEnv` 引用。不要将 API key、Cookie 或其他凭据直接提交到配置文件和版本库。
+
+## 作用域模型
+
+| 作用域 | 含义 | 典型内容 |
+| --- | --- | --- |
+| `global` | 跨工作区共享 | 长期偏好、固定指令、项目组合信息 |
+| `workspace` | 同一 DSH 工作区内共享 | 多个仓库共同使用的事实和约束 |
+| `project` | 当前 Git 仓库隔离 | 技术决策、失败尝试、里程碑、仓库约束 |
+| `personal` | 用户私有身份范围 | 私有且长期稳定的个人信息或偏好 |
+
+工作区是 DSH 的管理范围，仓库则是记忆隔离范围。插件会根据会话的真实 `cwd` 识别最近的 Git 仓库；通常无需手动填写身份覆盖项。
+
+完整术语说明见 [`GLOSSARY.md`](GLOSSARY.md)。
+
+## Agent 工具
+
+启用后，MemoryPilot 注册两个工具：
+
+### `memory_retrieve`
+
+按需查询跨会话记忆。`mode: "auto"` 会让 SystemOne 在普通召回与深度回顾之间选择，并决定应查询的作用域。
+
+适合以下问题：
+
+- “我们之前为什么选择这个实现？”
+- “上次排查这个故障时尝试过什么？”
+- “这个用户对输出格式有什么长期偏好？”
+
+### `memory_remember`
+
+请求长期保存一条明确的决策、偏好、已验证事实或里程碑。最终是否写入以及写入哪些作用域，仍由策略和决策模型控制。
+
+不得用该工具保存凭据、密钥、隐藏推理、临时日志或未经验证的猜测。
+
+## 安全设计
+
+MemoryPilot 默认采用拒绝策略：
+
+- 只有配置中明确授权的绑定才会出现在决策输入中。
+- 读权限和写权限按绑定分别控制。
+- `scopeId`、Hindsight bank 和 MemOS namespace 均由服务端确定，模型不能自行指定。
+- 模型返回的计划必须通过结构、能力、权限和写入证据校验。
+- 召回内容以 `trust: untrusted` 标记，并受单条长度和总长度限制。
+- 决策失败、超时或计划非法时返回 `noop` 或 `timeout`，不执行兜底式跨范围检索。
+- HTTP 适配器不会把第三方响应正文、请求头或凭据写入错误信息。
+
+## 配置入口
+
+浏览器配置页随插件发布，可从两个入口打开：
+
+- **设置 → 记忆调度（MemoryPilot）**
+- **侧栏 → 插件 → dsh-memory-pilot → 配置**
+
+配置页将“记忆系统”和“使用范围”分开管理：记忆系统负责连接信息，使用范围负责决定某个系统及其记忆库在哪些会话身份下可读或可写。
+
+## 开发
+
+```sh
+pnpm install
+npm test
+npm run check
+```
+
+- `npm test`：运行 Node.js 测试套件。
+- `npm run check`：对服务端与浏览器端入口执行语法检查。
+
+真机冒烟测试和端到端脚本需要可用的 DSH 宿主环境：
+
+- `test/plugin-smoke.mjs`
+- `scripts/e2e-live.mjs`
+- `scripts/bench-decision.mjs`
+- `scripts/probe-memos-write.mjs`
+
+运行前请阅读对应脚本中的环境变量和前置条件说明。
+
+## 项目结构
+
+```text
+src/
+  plugin.mjs          DSH 插件入口、配置 schema 与运行时组装
+  core.mjs            编排核心：快照、校验、预算、去重与渲染
+  adapters.mjs        决策适配器与 Hindsight / MemOS 后端适配器
+  registry.mjs        后端实例注册、权限过滤与能力描述
+  host.mjs            DSH 生命周期、会话钩子与回合捕获
+  configuration.mjs   配置归一化与工作区、仓库身份识别
+  discovery.mjs       Hindsight bank 发现与创建
+  settings-rpc.mjs    浏览器配置页使用的受信 RPC
+  connection-test.mjs 决策模型与记忆系统连接测试
+  tools.mjs           memory_retrieve / memory_remember 工具
+  memos-bridge.mjs    MemOS stdio JSON-RPC 桥接
+  memos-http.mjs      隔离 MemOS HTTP 搜索适配器
+lib/
+  client.js           DSH Web 配置界面
+examples/             配置示例
+test/                 单元测试、集成测试与可选宿主冒烟测试
+scripts/              真机端到端、基准和诊断脚本
+cordis.patch.yml       随包发布的安全默认 bundle patch
+GLOSSARY.md            领域术语说明
+```
+
+## 已知限制
+
+- 决策模型不可用时，本轮不会自动召回记忆，也不会降级为无条件搜索。
+- 后端写入通常是异步操作，成功受理不等于立即可检索。
+- 去重状态目前仅存在于当前进程；尚未实现持久化 outbox、跨进程幂等和跨后端事务。
+- MemOS HTTP 后端只适用于明确隔离的实例；共享 Hub 的隔离边界无法通过通用 API 独立验证。
+- `workspacePath` 表示包含其子目录的工作区根路径；仓库身份仍根据会话 `cwd` 独立识别。
 
 ## 常见问题
 
-### 安装时报 `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION` / "Lockfile failed supply-chain policy check"
+### 安装时报 `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION`
 
-pnpm ≥11 对锁文件整体执行「发布冷却期」校验（默认 1440 分钟 = 1 天）：任何
-依赖在锁文件中解析到的版本若发布不足一天，整个安装都会被拒绝——即使本次
-改动与该包无关。DSH profile 通常通过插件市场装了很多包，其中某个刚发版的
-依赖（例如某天刚发布的 `dshmarket`）会挡住**所有**后续插件操作。
+pnpm 可能启用了依赖发布冷却期。只要 profile 锁文件中的任意依赖版本过新，插件安装就可能被整体拒绝。
 
-解决（任选其一）：
+可以对本次安装临时关闭冷却期：
 
 ```sh
-# 方式一：单次放行（推荐，事后自动失效）
 dsh plugin --profile web add github:youluo1230/dsh-memory-pilot \
   --config.minimum-release-age=0
+```
 
-# 方式二：把该包加入冷却期豁免（pnpm-workspace.yaml / 全局 config.yaml）
-#   minimumReleaseAgeExclude:
-#   - dshmarket
+或者安装一个已经发布足够久的固定版本：
 
-# 方式三：直接指定一个成熟版本安装
+```sh
 dsh plugin --profile web add github:youluo1230/dsh-memory-pilot#v0.3.8
 ```
 
-注意：方式一只影响本次命令；若 profile 锁文件里还有其他「太新」的依赖，
-可能需要逐个排除或临时把 `minimumReleaseAge` 设为 0 装完再恢复。
+临时关闭冷却期会降低这一次安装的供应链保护强度。安装完成后应恢复原策略；如需长期豁免，建议只将确认可信的具体包加入 `minimumReleaseAgeExclude`。
 
+### 配置后没有触发记忆召回
+
+依次检查：
+
+1. 插件是否已启用。
+2. 当前会话 `cwd` 是否位于已注册的 DSH 工作区内。
+3. 决策模型地址和模型名是否完整，并且连接测试通过。
+4. 当前身份是否匹配至少一个具有读取权限的作用域绑定。
+5. 当前请求是否真的依赖缺失的跨会话信息；自包含任务不会触发召回。
+
+### 写入成功后为什么立即搜索不到？
+
+Hindsight 需要异步提取，MemOS 也可能在后台归纳完整回合。请等待后端处理完成后再检索；MemoryPilot 的“写入成功”只表示后端已经接受请求。
+
+## 卸载
+
+```sh
+dsh plugin --profile web remove dsh-memory-pilot
+```
+
+随后从 `dsh.profile.bundles` 中移除 `"dsh-memory-pilot"`。如果 profile 未启用热重载，请重启 DSH Web。
+
+## License
+
+[MIT](LICENSE)
