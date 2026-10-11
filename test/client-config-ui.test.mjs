@@ -76,10 +76,14 @@ test('resident memory tab DOM contract explains lifecycle and controlled mainten
   assert.match(source, /USER\/MEMORY 可人工修改，也可由受控自动维护/);
   assert.match(source, /"aria-label":\s*"常驻记忆文档"/);
   assert.match(source, /className:\s*"mp-resident-editor"/);
-  assert.match(source, /residentGet\(selectedResidentPath/);
-  assert.match(source, /residentPut\(selected\.target, residentContent, selected\.document\.revision, selectedResidentPath/);
+  assert.match(source, /withTimeout\(form\.residentGet\(projectPath\)/);
+  assert.match(source, /withTimeout\(form\.residentPut\(selected\.target, residentContent, selected\.document\.revision/);
   assert.match(source, /项目 MEMORY 所属仓库/);
   assert.match(source, /active === "scope" \|\| active === "resident"/);
+  assert.match(source, /读取失败，请重试/);
+  assert.match(source, /withTimeout\(form\.residentGet/);
+  assert.match(source, /未发现可用的 Git 仓库/);
+  assert.match(source, /selected\.target !== "project-memory" \|\| selectedResidentPath/);
 });
 
 test('configuration page exposes the required horizontal tabs and DSH-token CSS', () => {
