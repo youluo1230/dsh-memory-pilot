@@ -12,7 +12,7 @@ MemoryPilot 在每轮会话中判断**是否需要跨会话记忆、应查询哪
 - **分层作用域**：支持全局、工作区、仓库和个人作用域，并由服务端解析实际身份。
 - **两种检索模式**：`recall` 用于低延迟事实召回，`reflect` 用于跨历史记录的深度综合。
 - **受控写入**：仅保留明确、稳定且未来仍有价值的偏好、决策、约束、里程碑和可复用结论。
-- **多后端编排**：支持 Hindsight、MemOS 本地桥接和隔离的 MemOS HTTP 实例。
+- **多后端编排**：支持 Hindsight，以及 MemOS `memos-local-plugin` 的本地桥接接口。
 - **可视化配置**：在 DSH Web 中管理决策模型、记忆系统、作用范围和高级参数。
 - **显式工具**：向 Agent 注册 `memory_retrieve` 与 `memory_remember`，支持主动查询和保留记忆。
 - **安全失败**：决策超时、响应非法或后端不可用时，本轮记忆操作会被跳过，不阻塞正常对话。
@@ -35,8 +35,8 @@ MemoryPilot 在每轮会话中判断**是否需要跨会话记忆、应查询哪
 │ 决策适配器           │       │ 记忆后端               │
 │                     │       │                        │
 │ SystemOne 类型化决策 │       │ Hindsight              │
-│ OpenAI 兼容 JSON     │       │ MemOS stdio bridge     │
-└─────────────────────┘       │ MemOS HTTP             │
+│ OpenAI 兼容 JSON     │       │ MemOS local bridge     │
+└─────────────────────┘       │ MemOS local HTTP*      │
                               └────────────────────────┘
 ```
 
@@ -50,13 +50,24 @@ MemoryPilot 将“做什么”和“允许做什么”分开处理：
 
 ## 支持的记忆后端
 
-| 后端类型 | 传输方式 | 能力 | 适用场景 |
+| 后端类型 | 实际协议 | 能力 | 兼容范围 |
 | --- | --- | --- | --- |
-| [`hindsight`](https://github.com/vectorize-io/hindsight) | HTTP，绑定固定 bank | `search` / `deep` / `write` | 仓库或工作区级记忆；支持普通召回、深度回顾和异步写入 |
-| [`memos-bridge`](https://github.com/MemTensor/MemOS/tree/main/apps/memos-local-plugin) | stdio JSON-RPC | `search` / `write` | 通过 `@memtensor/memos-local-plugin` 捕获完整回合并在后台归纳 |
-| `memos` | HTTP | `search` | 连接真正隔离的 MemOS 实例；当前不提供通用写入契约 |
+| [`hindsight`](https://github.com/vectorize-io/hindsight) | Hindsight HTTP API，绑定固定 bank | `search` / `deep` / `write` | 标准 Hindsight 服务 |
+| [`memos-bridge`](https://github.com/MemTensor/MemOS/tree/main/apps/memos-local-plugin) | `memos-local-plugin` 的 stdio JSON-RPC | `search` / `write` | Hermes、OpenClaw 和 DSH 共用的 MemOS 本地插件；这是当前推荐的 MemOS 接入方式 |
+| `memos` | `memos-local-plugin` Viewer 的 `POST /api/v1/memory/search` | `search` | 仅用于运行同一本地插件 HTTP Viewer API 的专用、隔离实例；属于兼容/旧式接入 |
 
-> Hindsight 和 MemOS 的写入均可能包含异步处理。“已受理”不代表内容已经完成提取，也不保证能够立即检索到。
+### MemOS 兼容性说明
+
+这里的两个 MemOS 适配器都是围绕 **`@memtensor/memos-local-plugin`** 实现的，并不是面向所有 MemOS 产品的通用适配器：
+
+- `memos-bridge` 会启动插件目录中的 `dist/bridge.mjs`，调用 `core.health`、`memory.search`、`turn.start` 和 `turn.end`。它依赖本机安装好的 `memos-local-plugin`，默认目录为 `~/.hermes/memos-plugin`；目录名来自该插件的历史默认安装位置，并不意味着只能在 Hermes 中使用。
+- `memos` 调用的是该本地插件 Viewer 暴露的 `POST /api/v1/memory/search`，而且目前只支持搜索。它要求操作者确认服务及其数据库是专用、隔离的，不能直接指向共享 Hub。
+- MemOS 官方的**独立开源服务**使用 `/product/create_cube`、`/product/add`、`/product/search` 等 Cube API；**MemOS Cloud** 使用 `/api/openmem/v1/add/message`、`/api/openmem/v1/search/memory` 等 API。它们与上述本地插件协议不同，当前版本的 MemoryPilot **不能直接连接**。
+- 如果用户安装的是 MemOS 官方 DSH 本地插件或云插件，也可以让该插件独立负责自动召回和回合写入；但这不等于它已成为 MemoryPilot 可调度的后端，两套自动记忆机制同时启用还可能造成重复召回或重复写入。
+
+因此，只有独立部署 MemOS Server 或只持有 MemOS Cloud API Key、但没有兼容 `memos-local-plugin` 接口的用户，目前不能直接把它配置成 MemoryPilot 的 `memos` 后端。要纳入统一编排，需要另行实现对应的 `memos-server` 或 `memos-cloud` 适配器。
+
+> Hindsight 和 MemOS 本地插件的写入均可能包含异步处理。“已受理”不代表内容已经完成提取，也不保证能够立即检索到。
 
 ## 系统要求
 
@@ -225,8 +236,8 @@ src/
   settings-rpc.mjs    浏览器配置页使用的受信 RPC
   connection-test.mjs 决策模型与记忆系统连接测试
   tools.mjs           memory_retrieve / memory_remember 工具
-  memos-bridge.mjs    MemOS stdio JSON-RPC 桥接
-  memos-http.mjs      隔离 MemOS HTTP 搜索适配器
+  memos-bridge.mjs    memos-local-plugin stdio JSON-RPC 适配器
+  memos-http.mjs      memos-local-plugin Viewer HTTP 搜索适配器
 lib/
   client.js           DSH Web 配置界面
 examples/             配置示例
@@ -241,7 +252,7 @@ GLOSSARY.md            领域术语说明
 - 决策模型不可用时，本轮不会自动召回记忆，也不会降级为无条件搜索。
 - 后端写入通常是异步操作，成功受理不等于立即可检索。
 - 去重状态目前仅存在于当前进程；尚未实现持久化 outbox、跨进程幂等和跨后端事务。
-- MemOS HTTP 后端只适用于明确隔离的实例；共享 Hub 的隔离边界无法通过通用 API 独立验证。
+- 当前 MemOS HTTP 后端只兼容 `memos-local-plugin` Viewer 的搜索接口，不兼容 MemOS 独立服务的 Cube API 或 MemOS Cloud API；并且只适用于明确隔离的实例。
 - `workspacePath` 表示包含其子目录的工作区根路径；仓库身份仍根据会话 `cwd` 独立识别。
 
 ## 常见问题
