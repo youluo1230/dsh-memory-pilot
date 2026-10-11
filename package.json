@@ -1,7 +1,8 @@
 {
   "name": "dsh-memory-pilot",
   "version": "0.3.8",
-  "private": true,
+  "private": false,
+  "license": "MIT",
   "type": "module",
   "description": "Decision-driven memory orchestration for DeepSeek Harness",
   "main": "./src/plugin.mjs",
