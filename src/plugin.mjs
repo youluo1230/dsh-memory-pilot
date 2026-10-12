@@ -212,19 +212,20 @@ export function apply(ctx, config) {
     acceptsSession,
     identity: identityFor,
     createMessage: text => createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'plugin:dsh-memory-pilot', form: 'recall' } }),
+    // rc.2 read path (dsh-session-persistence-jsonl validateStoredEvents) refuses any
+    // event type outside its built-in vocabulary unless marked ignorable, and rc.2
+    // append() offers no way to set that marker — appending a custom type here would
+    // poison the session log (history fails to load). Audit goes to the harness log;
+    // the trajectory client keeps rendering legacy plugin/observation events.
     onResidentSnapshot: (session, snapshot, location = {}) => {
-      session.append('plugin/observation', { plugin:'dsh-memory-pilot',kind:'resident-memory',version:1,turn:location.turn??0,
-        summary:'MemoryPilot resident memory loaded',data:{status:'ok',sources:Object.entries(snapshot.resident).filter(([,value])=>Boolean(value)).map(([scope,value])=>({scope,chars:value.length})),soul:Boolean(snapshot.soul)} });
+      const sources = Object.entries(snapshot.resident).filter(([,value])=>Boolean(value)).map(([scope,value])=>`${scope}:${value.length}`).join(',') || 'none';
+      ctx.logger.info(`MemoryPilot resident memory loaded turn=${location.turn ?? 0} sources=${sources} soul=${Boolean(snapshot.soul)}`);
     },
     onTrace: (session, trace, location = {}) => {
       const scope = trace.executions?.[0]?.scope ?? 'none';
       const engine = trace.executions?.[0]?.engine ?? 'none';
       const operation = trace.executions?.[0]?.operation ?? 'none';
-      session.append('plugin/observation', {
-        plugin: 'dsh-memory-pilot', kind: trace.kind, version: trace.schemaVersion,
-        turn: location.turn ?? 0, ...(location.step ? { step: location.step } : {}),
-        summary: `MemoryPilot ${trace.status}: ${scope} ${engine} ${operation}`.slice(0, 120), data: trace,
-      });
+      ctx.logger.info(`MemoryPilot ${trace.kind} ${trace.status}: ${scope} ${engine} ${operation} turn=${location.turn ?? 0}${location.step ? ` step=${location.step}` : ''}`);
     },
     onError: code => ctx.logger.warn(`MemoryPilot ${code}`),
   });
