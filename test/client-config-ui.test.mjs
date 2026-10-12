@@ -308,3 +308,27 @@ test('filterRoutes combines scope and system filters and preserves source rows',
   assert.equal(rows.length, 3);
   assert.deepEqual(Array.from(filterRoutes(rows, { scope: 'all', systemId: 'all' }), row => row.id), ['one', 'two', 'three']);
 });
+
+test('systems and scope tabs expose delete actions that remove systems, routes, and overrides', () => {
+  // Source-level guards: the systems tab renders a delete button wired to
+  // removeSystem, and removeSystem drops the system plus its routes.
+  const systemsRender = source.slice(source.indexOf('if (active === "systems")'), source.indexOf('if (active === "scope")'));
+  assert.match(systemsRender, /"删除"/);
+  assert.match(source, /removeSystem = id =>/);
+  assert.match(source, /systems: current\.systems\.filter\(item => item\.id !== id\)/);
+  assert.match(source, /routes: current\.routes\.filter\(route => route\.systemId !== id\)/);
+  // The scope tab renders delete for concrete bindings and drops overrides + routes.
+  const scopeRender = source.slice(source.indexOf('if (active === "scope") {'), source.indexOf('if (active === "resident")'));
+  assert.match(scopeRender, /"删除"/);
+  assert.match(scopeRender, /removeScopeOverride\(current\.scopeOverrides/);
+  assert.match(scopeRender, /routes: current\.routes\.filter/);
+});
+
+test('resident tab reloads when a dependency changes mid-flight instead of deadlocking', () => {
+  // Regression: the effect early-returned unless status === 'idle', so a
+  // discovery-driven re-render during the fetch (live=false) deadlocked the tab
+  // on 永久"等待读取文档…" — the resident effect must re-issue while loading.
+  const residentEffect = source.slice(source.indexOf('const [resident, setResident]'), source.indexOf('if (snap.status !== "ready" || !draft)'));
+  assert.match(residentEffect, /resident\.status === "ready" \|\| resident\.status === "empty" \|\| resident\.status === "failed"/);
+  assert.doesNotMatch(residentEffect, /resident\.status !== "idle"/);
+});
