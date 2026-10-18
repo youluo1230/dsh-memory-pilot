@@ -162,3 +162,21 @@ test('remote settings RPC sanitizes provider failures', async () => {
   const result = await rpc('mutate', { revision: 3, ops: [{ op: 'set', path: ['enabled'], value: false }] });
   assert.deepEqual(result, { ok: false, error: { code: 'settings-rejected', message: 'MemoryPilot configuration was rejected' } });
 });
+
+test('remote settings RPC persists the decisionEnabled switch from the panel', async () => {
+  // The settings panel exposes "使用决策模型". If this field is not on the
+  // allow-list the toggle appears to save but is silently rejected.
+  let current = descriptor({ enabled: true, decisionEnabled: true }, 1);
+  const writes = [];
+  const settings = { writable: true, describe: () => [current], async mutate(ns, ops, revision) {
+    writes.push({ ns, ops, revision });
+    current = descriptor({ enabled: true, decisionEnabled: false }, 2);
+  } };
+  const rpc = createSettingsRpcHandler(settings);
+  const off = await rpc('mutate', { revision: 1, ops: [{ op: 'set', path: ['decisionEnabled'], value: false }] });
+  assert.equal(off.ok, true);
+  assert.deepEqual(writes[0].ops, [{ op: 'set', path: ['decisionEnabled'], value: false }]);
+  assert.equal(writes[0].ns, 'dsh-memory-pilot');
+  const on = await rpc('mutate', { revision: 2, ops: [{ op: 'set', path: ['decisionEnabled'], value: true }] });
+  assert.equal(on.ok, true);
+});

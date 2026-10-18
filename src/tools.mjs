@@ -26,7 +26,16 @@ export function registerMemoryTools(ctx, { runtimeFor, identityFor, residentSnap
     async execute(args, exec) {
       const { session, runtime } = owner(exec);
       if (!runtime) return { status:'disabled',context:'',truncated:false };
-      const result = await runtime.orchestrator.run(event(session,exec.callId,'message',bounded(args.query,'query')),{budgetMs:retrieveBudgetMs,signal:exec.signal});
+      const query = bounded(args.query, 'query');
+      // Autonomous mode: the calling agent already decided that memory is
+      // needed, so query read-enabled backends directly instead of asking an
+      // external decision model what to do.
+      if (typeof runtime.directRetrieve === 'function') {
+        const direct = await runtime.directRetrieve(query, { signal: exec.signal });
+        return { status: direct.status, context: direct.context || '', truncated: Boolean(direct.truncated) };
+      }
+      if (!runtime.orchestrator) return { status:'disabled',context:'',truncated:false };
+      const result = await runtime.orchestrator.run(event(session,exec.callId,'message',query),{budgetMs:retrieveBudgetMs,signal:exec.signal});
       return { status:result.status,context:result.context || '',truncated:Boolean(result.context?.includes('"truncated":true')) };
     },
   });
@@ -44,6 +53,17 @@ export function registerMemoryTools(ctx, { runtimeFor, identityFor, residentSnap
         const result = await runtime.retentionRouter.retain(memoryEvent, snapshot, identityFor(session), { signal: exec.signal });
         return { status: result.status, accepted: result.accepted ?? 0 };
       }
+      // Autonomous mode: an explicit memory_remember call IS the decision, so
+      // write straight to the single writable backend. Retaining to resident
+      // files still needs the decision model to pick a target and rewrite
+      // content, so that path stays closed here.
+      if (typeof runtime.directRetain === 'function') {
+        try {
+          const result = await runtime.directRetain(memoryEvent, { signal: exec.signal });
+          return { status: result?.status ?? 'ok', accepted: result?.accepted ?? 0 };
+        } catch { return { status: 'error', accepted: 0 }; }
+      }
+      if (!runtime.orchestrator) return { status:'disabled',accepted:0 };
       const result = await runtime.orchestrator.run(memoryEvent,{budgetMs:rememberBudgetMs,signal:exec.signal});
       return { status:result.status,accepted:(result.results||[]).filter(row=>row.operation==='write'&&row.status==='ok').length };
     },

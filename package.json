@@ -1,6 +1,6 @@
 {
   "name": "dsh-memory-pilot",
-  "version": "0.3.10",
+  "version": "0.3.14",
   "private": false,
   "license": "MIT",
   "type": "module",

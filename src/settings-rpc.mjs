@@ -4,7 +4,7 @@ export const SETTINGS_RPC_CHANNEL = '/dsh-memory-pilot-settings';
 export const SETTINGS_NAMESPACE = 'dsh-memory-pilot';
 
 const ALLOWED_FIELDS = new Set([
-  'enabled', 'workspacePath', 'projectId', 'actorId', 'workspaceId',
+  'enabled', 'decisionEnabled', 'workspacePath', 'projectId', 'actorId', 'workspaceId',
   'decisionBaseUrl', 'decisionModel', 'decisionProtocol', 'decisionKeyEnv', 'budgetMs',
   'captureBudgetMs', 'backends', 'scopeOverrides',
 ]);

@@ -332,3 +332,13 @@ test('resident tab reloads when a dependency changes mid-flight instead of deadl
   assert.match(residentEffect, /resident\.status === "ready" \|\| resident\.status === "empty" \|\| resident\.status === "failed"/);
   assert.doesNotMatch(residentEffect, /resident\.status !== "idle"/);
 });
+
+test('decision panel exposes the decision-model switch and reflects autonomous mode', () => {
+  // The switch must be reachable from the UI (not only the YAML), and the
+  // summary must show "自主判断" when it is off.
+  assert.match(source, /decisionEnabled/);
+  assert.match(source, /使用决策模型/);
+  assert.match(source, /自主判断/);
+  // Field must be part of the scalar save list, or toggling it never persists.
+  assert.match(source, /const SCALAR_FIELDS = \["enabled", "decisionEnabled"/);
+});

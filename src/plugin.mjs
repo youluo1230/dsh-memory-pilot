@@ -34,6 +34,12 @@ export const inject = ['connection', 'webServer', 'settings', 'workspaceRegistry
 // field, so a non-volatile schema would make the panel invisible.
 export const Config = Schema.object({
   enabled: Schema.boolean().default(false).volatile(),
+  // Master switch for the external decision model. When false, MemoryPilot runs
+  // in "autonomous" mode: no decision endpoint is contacted, and the calling
+  // agent decides for itself when to invoke memory_retrieve / memory_remember.
+  // This keeps memory working when the decision model is stopped or out of
+  // memory, instead of failing every call with an opaque adapter error.
+  decisionEnabled: Schema.boolean().default(true).volatile(),
   actorId: Schema.string().default('').volatile(),
   projectId: Schema.string().default('').volatile(),
   workspaceId: Schema.string().default('').volatile(),
@@ -118,7 +124,12 @@ export function apply(ctx, config) {
   };
   const runtimeFor = session => {
     const resolved = prepared();
-    if (!resolved.enabled || !resolved.decisionBaseUrl || !resolved.decisionModel) return null;
+    // `enabled` gates the plugin. The decision endpoint is only required when
+    // the external decision model is switched on; in autonomous mode the agent
+    // drives the memory tools directly.
+    if (!resolved.enabled) return null;
+    const usesDecision = resolved.decisionEnabled !== false;
+    if (usesDecision && (!resolved.decisionBaseUrl || !resolved.decisionModel)) return null;
     const identity = identityFor(session);
     const key = JSON.stringify([identity.actorId, identity.projectKey, identity.projectId, identity.workspaceId, identity.workspacePath]);
     if (runtimes.has(key)) return runtimes.get(key);
@@ -126,29 +137,64 @@ export function apply(ctx, config) {
     const registry = bindings.length ? createRegistry({ bindings, identities: { personal: identity.actorId, project: identity.projectId, workspace: identity.workspaceId } }) : null;
     const createDecision = resolved.decisionProtocol === 'openai' ? createOpenAICompatibleDecision : createSystemOneDecision;
     const apiKey = resolved.decisionKeyEnv ? process.env[resolved.decisionKeyEnv] : undefined;
-    const decision = createDecision({ baseUrl: resolved.decisionBaseUrl, model: resolved.decisionModel, apiKey });
-    const orchestrator = registry ? createOrchestrator({
+    const decision = usesDecision
+      ? createDecision({ baseUrl: resolved.decisionBaseUrl, model: resolved.decisionModel, apiKey })
+      : null;
+    const orchestrator = registry && decision ? createOrchestrator({
       decision, backends: registry.backends, policy: registry.policy, budgetMs: resolved.budgetMs,
       onAudit: record => ctx.logger.info(`MemoryPilot ${JSON.stringify(record)}`),
     }) : null;
     const writable = Object.entries(registry?.backends ?? {}).filter(([,backend]) => backend.capabilities.includes('write'));
-    const externalRetain = writable.length === 1 ? async (event, { signal } = {}) => {
-      const [backendId,backend] = writable[0];
-      const binding=bindings.find(row=>row.id===backendId);
-      await backend.execute({operation:'write',backend:backendId,scope:binding.scope,scopeId:binding.scopeId,content:event.text,evidence:{eventId:event.id,quote:event.text}},{signal});
+    const readable = Object.entries(registry?.backends ?? {}).filter(([,backend]) => backend.capabilities.includes('search'));
+    const retainOn = async ([backendId, backend], event, { signal } = {}) => {
+      const binding = bindings.find(row => row.id === backendId);
+      // The adapter validates write evidence against the event, so the event
+      // must travel in the execution options — not only inside the action.
+      await backend.execute({operation:'write',backend:backendId,scope:binding.scope,scopeId:binding.scopeId,content:event.text,evidence:{eventId:event.id,quote:event.text}},{signal,event});
       return {status:'ok',accepted:1};
-    } : undefined;
-    const retentionRouter = typeof decision.decideRetention === 'function'
+    };
+    // The decision model may route an external write only when the destination
+    // is unambiguous; with several writable backends it must not guess.
+    const externalRetain = writable.length === 1 ? (event, options) => retainOn(writable[0], event, options) : undefined;
+    // Autonomous recall: query every readable backend directly, no decision gate.
+    const directRetrieve = readable.length ? async (query, { signal } = {}) => {
+      const settled = await Promise.allSettled(readable.map(async ([backendId, backend]) => {
+        const binding = bindings.find(row => row.id === backendId);
+        const value = await backend.execute({
+          operation: 'search', backend: backendId, scope: binding.scope, scopeId: binding.scopeId, query,
+        }, { signal });
+        return typeof value?.text === 'string' ? value.text.trim() : '';
+      }));
+      const hits = settled.filter(row => row.status === 'fulfilled' && row.value).map(row => row.value);
+      const failed = settled.some(row => row.status === 'rejected');
+      return {
+        status: hits.length ? 'ok' : (failed ? 'error' : 'noop'),
+        context: hits.join('\n\n').slice(0, 8000),
+        results: [], truncated: hits.join('\n\n').length > 8000,
+      };
+    } : null;
+    const retentionRouter = decision && typeof decision.decideRetention === 'function'
       ? createRetentionRouter({ decision, residentMemory, externalRetain,
         externalAvailable: () => writable.length === 1,
         onAudit: record => ctx.logger.info(`MemoryPilot ${JSON.stringify(record)}`) }) : undefined;
-    const runtime = { registry, orchestrator, retentionRouter };
+    // Autonomous retention: an explicit memory_remember IS the decision, so the
+    // content goes to every write-enabled backend. Fanning out is deliberate —
+    // the agent asked for a durable record and has no basis to prefer one store,
+    // and partial success still counts as retained.
+    const directRetain = writable.length ? async (event, { signal } = {}) => {
+      const settled = await Promise.allSettled(writable.map(entry => retainOn(entry, event, { signal })));
+      const accepted = settled.filter(row => row.status === 'fulfilled').length;
+      if (!accepted) throw new Error('No backend accepted the write');
+      return {status:'ok',accepted};
+    } : null;
+    const runtime = { registry, orchestrator, retentionRouter, directRetrieve, directRetain, autonomous: !usesDecision };
     runtimes.set(key, runtime);
-    debug(`memory runtime built for ${identity.projectId}:${identity.workspaceId}`);
+    debug(`memory runtime built for ${identity.projectId}:${identity.workspaceId} mode=${usesDecision ? 'decision' : 'autonomous'}`);
     return runtime;
   };
   const initial = prepared();
-  if (initial.enabled && initial.decisionBaseUrl && initial.decisionModel) {
+  if (initial.enabled && (initial.decisionEnabled === false
+    || (initial.decisionBaseUrl && initial.decisionModel))) {
     const firstPath = typeof ctx.workspaceRegistry?.list === 'function'
       ? ctx.workspaceRegistry.list()[0]?.path : initial.workspacePath;
     if (firstPath) runtimeFor({ header: { cwd: firstPath } }); // preserve fail-fast configuration
