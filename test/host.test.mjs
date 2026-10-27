@@ -19,12 +19,15 @@ test('accepted first step injects only memory context and records trace out of b
  assert.equal(result.messages[0],f.decision.messages[0]);assert.equal(result.messages.length,2);assert.equal(result.messages[1].content,'memory');
  assert.equal(JSON.stringify(result.messages).includes('TRACE-ONLY'),false);assert.deepEqual(traces,[['s',{schemaVersion:1,kind:'retrieval',marker:'TRACE-ONLY'}]]);await f.host.dispose();
 });
-test('resident memory is frozen once per session, injected before dynamic recall, and shown to admission decision',async()=>{
+test('resident memory is re-injected each turn and shown to the admission decision',async()=>{
  let loads=0; const snapshots=[];
  const f=fixture({residentSnapshotFor:async()=>{loads++;return {context:'resident-context',resident:{user:'Chinese',global:'pnpm',project:'ESM'}};},orchestrator:{async run(event){snapshots.push(event.residentMemory);return {context:'dynamic-memory'};}}});
  const result=await f.agentHooks.get('agent/pre-step')(f.payload,async()=>f.decision);
  await f.agentHooks.get('agent/pre-step')({...f.payload,turn:2},async()=>f.decision);
- assert.equal(loads,1);assert.deepEqual(snapshots,[{user:'Chinese',global:'pnpm',project:'ESM'}]);
+ // The snapshot's file read is cached by the plugin, but the injection itself is
+ // per-turn: every turn must hand the model resident memory and give the
+ // admission decision the same view.
+ assert.equal(loads,2);assert.deepEqual(snapshots,[{user:'Chinese',global:'pnpm',project:'ESM'},{user:'Chinese',global:'pnpm',project:'ESM'}]);
  assert.deepEqual(result.messages.slice(1).map(message=>message.content),['resident-context','dynamic-memory']);
  await f.host.dispose();
 });
@@ -44,11 +47,14 @@ test('automatic retrieval includes bounded visible conversation context but excl
 test('listener is registered on the agent scope, not the plugin-global scope',async()=>{
  const f=fixture(); assert.equal(f.hooks.has('agent/pre-step'),false); assert.equal(f.agentHooks.has('agent/pre-step'),true); await f.host.dispose();
 });
-test('automatic retrieval runs only for the session first real user turn',async()=>{
+test('automatic retrieval runs for every real user turn, not only the first',async()=>{
+ // The agent instance spans the whole conversation, so admission must be tracked
+ // per turn: a single boolean skipped every follow-up silently.
  const f=fixture();
- await f.agentHooks.get('agent/pre-step')(f.payload,async()=>f.decision);
- await f.agentHooks.get('agent/pre-step')({...f.payload,turn:2},async()=>f.decision);
- assert.equal(f.calls.length,1); await f.host.dispose();
+ const user={source:{kind:'user'},content:[{type:'text',text:'hello'}]};
+ await f.agentHooks.get('agent/pre-step')({...f.payload,messages:[user]},async()=>f.decision);
+ await f.agentHooks.get('agent/pre-step')({...f.payload,turn:2,messages:[user]},async()=>f.decision);
+ assert.equal(f.calls.length,2); await f.host.dispose();
 });
 test('rejected input and later steps never call decision model',async()=>{
  const f=fixture();await f.agentHooks.get('agent/pre-step')(f.payload,async()=>({kind:'reject'}));
@@ -61,7 +67,7 @@ test('every completed turn is captured directly to global memory without a decis
  await f.agentHooks.get('agent/pre-step')({...f.payload,turn:2},async()=>f.decision);
  f.hooks.get('session/event')(f.session,{type:'assistant/message',data:{turn:2,message:{content:[{type:'text',text:'second answer'}]}}});
  f.hooks.get('session/event')(f.session,{type:'turn/end',data:{turn:2,reason:{kind:'completed'}}});
- await f.host.dispose(); assert.equal(f.calls.length,1); assert.deepEqual(captured.map(turn=>[turn.userText,turn.assistantText]),[['hello','first answer'],['hello','second answer']]);
+ await f.host.dispose(); assert.equal(f.calls.length,2); assert.deepEqual(captured.map(turn=>[turn.userText,turn.assistantText]),[['hello','first answer'],['hello','second answer']]);
 });
 test('capture is opt-in and excludes reasoning',async()=>{
  const f=fixture({capture:true});await f.agentHooks.get('agent/pre-step')(f.payload,async()=>f.decision);
@@ -102,4 +108,143 @@ test('orchestratorFor routes each session without reusing the first project faca
  assert.deepEqual(seen,[['/test','test'],['/two','two']]);
  assert.equal(first.messages[1].content,'test');assert.equal(other.messages[1].content,'two');
  await f.host.dispose();
+});
+
+test('injected memory tells the UI what it was, not only its text', async () => {
+  // A `recall` source with no `references` array renders as opaque raw JSON in
+  // the Chat UI — which is what a reader saw instead of a memory summary. The
+  // injection must therefore carry the label and the hit count.
+  const seen = [];
+  const f = fixture({
+    createMessage: (text, meta) => { seen.push({ text, meta }); return { content: text }; },
+    orchestrator: { async run() { return { context: 'recalled text', status: 'ok', trace: {
+      executions: [{ operation: 'search', response: { status: 'ok', hitCount: 2 } }],
+      injection: { truncated: false } } }; } },
+  });
+  await f.agentHooks.get('agent/pre-step')(f.payload, async () => f.decision);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].text, 'recalled text');
+  assert.equal(seen[0].meta.count, 2);
+  assert.match(seen[0].meta.label, /召回/);
+  await f.host.dispose();
+});
+
+test('resident memory is injected once per turn, not once per session', async () => {
+  // The admission flag is per agent instance, and the runtime creates a fresh
+  // agent for every turn, so each turn injects resident memory exactly once.
+  // Within one turn, later steps must not repeat it: a measured turn carried
+  // 1 899 characters of resident text against a 13-character user message.
+  const created = [];
+  const f = fixture({
+    residentSnapshotFor: async () => ({ context: 'RESIDENT-BODY', resident: { global: 'm' } }),
+    createMessage: (text) => { created.push(text); return { content: text }; },
+  });
+  await f.agentHooks.get('agent/pre-step')(f.payload, async () => f.decision);
+  // Later steps of the same agent instance stay silent.
+  await f.agentHooks.get('agent/pre-step')({ ...f.payload, step: 2 }, async () => f.decision);
+  await f.agentHooks.get('agent/pre-step')({ ...f.payload, step: 3 }, async () => f.decision);
+  assert.equal(created.filter(text => text === 'RESIDENT-BODY').length, 1, 'one injection within a turn');
+  await f.host.dispose();
+});
+
+test('every turn runs the memory decision, not only the first', async () => {
+  // The agent instance handles every turn of a conversation. Admission used to be
+  // a single boolean, so a four-turn Session produced one decision and skipped
+  // the rest without a trace — the decision log showed one row and memory never
+  // ran again after the first message.
+  const runs = [];
+  const f = fixture({ orchestrator: { async run(event) { runs.push(event.text); return { context: 'mem' }; } } });
+  const user = { source: { kind: 'user' }, content: [{ type: 'text', text: 'q' }] };
+  for (const turn of [1, 2, 3, 4]) {
+    await f.agentHooks.get('agent/pre-step')({ ...f.payload, turn, messages: [user] }, async () => f.decision);
+  }
+  assert.equal(runs.length, 4, 'each turn must reach the decision');
+  await f.host.dispose();
+});
+
+test('a second step of the same turn does not repeat the decision', async () => {
+  const runs = [];
+  const f = fixture({ orchestrator: { async run(event) { runs.push(event.text); return { context: 'mem' }; } } });
+  await f.agentHooks.get('agent/pre-step')(f.payload, async () => f.decision);
+  await f.agentHooks.get('agent/pre-step')({ ...f.payload, step: 2 }, async () => f.decision);
+  assert.equal(runs.length, 1, 'one decision per turn, not per step');
+  await f.host.dispose();
+});
+
+test('a completed turn reports its write so the log can show it', async () => {
+  // Capture runs silently after the answer. That silence was indistinguishable
+  // from failure: a reader saw rows with no writes and concluded nothing was
+  // being stored, even when both stores had accepted the turn.
+  const traces = [];
+  const f = fixture({ capture: true, captureTurn: async () => [{ status: 'fulfilled', value: { accepted: true } }, { status: 'fulfilled', value: { accepted: true } }],
+    onTrace: (_session, trace, location) => traces.push({ trace, location }) });
+  await f.agentHooks.get('agent/pre-step')(f.payload, async () => f.decision);
+  f.hooks.get('session/event')(f.session, { type: 'assistant/message', data: { turn: 1, message: { content: [{ type: 'text', text: 'answer' }] } } });
+  f.hooks.get('session/event')(f.session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+  await new Promise(resolve => setTimeout(resolve, 10));
+  const capture = traces.find(item => item.trace?.capture);
+  assert.ok(capture, 'the write must publish a trace');
+  assert.equal(capture.trace.capture.stored, 2);
+  assert.equal(capture.trace.capture.failed, 0);
+  assert.equal(capture.trace.kind, 'retention');
+  await f.host.dispose();
+});
+
+test('safety runs for a real DSH agent whose context is not the session', async () => {
+  // DSH calls `agent/pre-step` with a payload whose `agent` is the live Agent:
+  // it has `session` and `ctx`, but the Agent itself is NOT the Session. Passing
+  // `payload.agent` where a Session was expected made every downstream read of
+  // `session.header` throw `Cannot read properties of undefined`, and because the
+  // throw happened inside the host's own handler the whole turn ended `error`.
+  // The existing fixtures hid this by never supplying `safety`, so the crash only
+  // showed up in production and after every turn that followed one with memory on.
+  const hooks = new Map(), agentHooks = new Map();
+  const ctx = { on(name, fn) { hooks.set(name, fn); return () => hooks.delete(name); } };
+  const judged = [];
+  const host = attachHost(ctx, {
+    orchestrator: { async run() { return { context: '' }; } },
+    identity: () => ({ actorId: 'alice', projectId: 'p' }),
+    createMessage: (text, meta = {}) => ({ content: text, source: { kind: 'plugin:test', meta } }),
+    // The stub insists on a real Session, the way the plugin's safety hook does.
+    safety: (session, input) => {
+      if (typeof session?.header?.cwd !== 'string') throw new TypeError("Cannot read properties of undefined (reading 'header')");
+      judged.push(input.turn);
+      return { trace: { kind: 'safety' }, caution: 'careful', label: '决策提示' };
+    },
+  });
+  const session = { id: 's', header: { cwd: '/test' } };
+  const agent = { session, ctx: { on(name, fn) { agentHooks.set(name, fn); return () => agentHooks.delete(name); } } };
+  hooks.get('agent/created')({ agent });
+  const user = { source: { kind: 'user' }, content: [{ type: 'text', text: 'hello' }] };
+  const payload = { agent, turn: 1, step: 1, signal: new AbortController().signal, messages: [user] };
+  const result = await agentHooks.get('agent/pre-step')(payload, async () => ({ kind: 'enter', messages: [user] }));
+  assert.deepEqual(judged, [1], 'the judge must receive the payload turn');
+  assert.equal(result.messages.at(-1).content, 'careful');
+  await host.dispose();
+});
+
+test('a throwing safety judge is swallowed and never fails the turn', async () => {
+  // The host already caught the throw, but silently: the turn survived while the
+  // error became invisible. It must still be reported through onError.
+  const errors = [];
+  const hooks = new Map(), agentHooks = new Map();
+  const ctx = { on(name, fn) { hooks.set(name, fn); return () => hooks.delete(name); } };
+  const host = attachHost(ctx, {
+    orchestrator: { async run() { return { context: '' }; } },
+    identity: () => ({ actorId: 'alice', projectId: 'p' }),
+    createMessage: text => ({ content: text, source: { kind: 'plugin:test' } }),
+    safety: () => { throw new Error('judge exploded'); },
+    onError: code => errors.push(code),
+  });
+  const session = { id: 's', header: { cwd: '/test' } };
+  const agent = { session, ctx: { on(name, fn) { agentHooks.set(name, fn); return () => agentHooks.delete(name); } } };
+  hooks.get('agent/created')({ agent });
+  const user = { source: { kind: 'user' }, content: [{ type: 'text', text: 'hello' }] };
+  const result = await agentHooks.get('agent/pre-step')(
+    { agent, turn: 1, step: 1, signal: new AbortController().signal, messages: [user] },
+    async () => ({ kind: 'enter', messages: [user] }),
+  );
+  assert.equal(result.kind, 'enter');
+  assert.deepEqual(errors, ['safety_decision_failed']);
+  await host.dispose();
 });
