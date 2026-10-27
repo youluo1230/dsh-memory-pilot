@@ -1,5 +1,73 @@
 // DSH-specific lifecycle adapter. No host imports: the same seam is used by tests.
-export function attachHost(ctx, { orchestrator, orchestratorFor = () => orchestrator, createMessage, identity, residentSnapshotFor, acceptsSession = () => true, retrievalBudgetMs = 60000, capture = false, captureTurn, captureBudgetMs = 60000, maxTextChars = 12000, onResidentSnapshot = () => {}, onTrace = () => {}, onError = () => {} }) {
+// A durable, compact form of the decision for the Session log. The projection
+// rebuilds from log events after a restart, so anything kept only in memory is
+// lost; this is the record the decision log reads back.
+export function decisionForLog(trace, location = {}) {
+  if (!trace || typeof trace !== 'object') return undefined;
+  const trim = (value, max) => typeof value === 'string' ? value.slice(0, max) : undefined;
+  const entry = {
+    turn: Number.isSafeInteger(location.turn) ? location.turn : 0,
+    step: Number.isSafeInteger(location.step) ? location.step : 0,
+    question: trim(location.question, 400) || '',
+    // Which judging concern produced this. Carried on the record so the log can
+    // classify without inferring from memory verbs that a non-memory point never uses.
+    subject: trim(trace.subject, 64) || 'memory.read',
+    kind: trim(trace.kind, 32) || 'unknown',
+    status: trim(trace.status, 32) || 'unknown',
+    protocol: trim(trace.decision?.protocol, 32) || 'unknown',
+    model: trim(trace.decision?.model, 120) || 'unknown',
+    decisionDurationMs: Number.isFinite(trace.decision?.durationMs) ? trace.decision.durationMs : 0,
+    totalDurationMs: Number.isFinite(trace.totalDurationMs) ? trace.totalDurationMs : 0,
+    questions: Array.isArray(trace.decision?.questionNames) ? trace.decision.questionNames.slice(0, 16).filter(name => typeof name === 'string') : [],
+    answers: Array.isArray(trace.decision?.questionNames) ? trace.decision.questionNames.slice(0, 16).map(name => {
+      const answer = trace.decision.answers?.[name] || {};
+      const out = { name, choice: trim(answer.choice, 64) || '' };
+      const probability = answer.probabilities?.[answer.choice];
+      if (Number.isFinite(probability)) out.confidence = Math.round(probability * 100) / 100;
+      return out;
+    }) : [],
+    actions: Array.isArray(trace.plan?.actions) ? trace.plan.actions.slice(0, 32).map(action => ({
+      backend: trim(action.backendId, 64) || 'unknown', scope: trim(action.scope, 32) || 'unknown', operation: trim(action.operation, 32) || 'unknown',
+    })) : [],
+    executions: Array.isArray(trace.executions) ? trace.executions.slice(0, 32).map(row => ({
+      backend: trim(row.backendId, 64) || 'unknown', scope: trim(row.scope, 32) || 'unknown', operation: trim(row.operation, 32) || 'unknown',
+      status: trim(row.response?.status, 32) || 'ok',
+      ...(Number.isSafeInteger(row.response?.hitCount) ? { hitCount: row.response.hitCount } : {}),
+      ...(Number.isSafeInteger(row.response?.droppedLowRelevance) ? { droppedLowRelevance: row.response.droppedLowRelevance } : {}),
+      ...(typeof row.response?.preview === 'string' ? { preview: trim(row.response.preview, 300) } : {}),
+      durationMs: Number.isFinite(row.durationMs) ? row.durationMs : 0,
+    })) : [],
+    injectedChars: Number.isSafeInteger(trace.injection?.contextChars) ? trace.injection.contextChars : 0,
+  };
+  const options = trace.decision?.questionOptions;
+  if (options && typeof options === 'object') {
+    entry.questionOptions = Object.fromEntries(Object.entries(options).slice(0, 16)
+      .filter(([, list]) => Array.isArray(list) && list.length)
+      .map(([name, list]) => [name, list.slice(0, 16).filter(item => typeof item === 'string')]));
+  }
+  return entry;
+}
+
+// A trace for the write that happens after the answer. Capture reports either
+// per-backend settled results or nothing, so the shape here is deliberately small:
+// which backends stored the turn and whether each one succeeded.
+export function captureTrace(settled, { turn = 0, durationMs = 0, question = '', assistantChars = 0 } = {}) {
+  const results = Array.isArray(settled) ? settled : settled === undefined ? [] : [{ status: 'fulfilled', value: settled }];
+  const stored = results.filter(item => item?.status === 'fulfilled').length;
+  const failed = results.length - stored;
+  return {
+    schemaVersion: 1, kind: 'retention', status: stored > 0 ? 'ok' : failed > 0 ? 'error' : 'noop',
+    marker: 'capture', question,
+    totalDurationMs: Math.round(durationMs),
+    candidates: [], plan: { validation: 'accepted', actions: [] },
+    decision: { protocol: 'capture', model: 'turn-end', questionNames: [], answers: {}, durationMs: Math.round(durationMs) },
+    executions: [],
+    injection: { sourceCount: stored, contextChars: assistantChars, truncated: false },
+    capture: { stored, failed },
+  };
+}
+
+export function attachHost(ctx, { orchestrator, orchestratorFor = () => orchestrator, createMessage, identity, residentSnapshotFor, acceptsSession = () => true, retrievalBudgetMs = 60000, capture = false, captureTurn, captureBudgetMs = 60000, maxTextChars = 12000, onResidentSnapshot = () => {}, onTrace = () => {}, onError = () => {}, safety = () => undefined }) {
   // capture/captureBudgetMs may be callables so a plugin backed by live
   // (volatile) config can re-evaluate them per event without remounting.
   const captureOn = typeof capture === 'function' ? capture : () => capture === true;
@@ -52,29 +120,65 @@ export function attachHost(ctx, { orchestrator, orchestratorFor = () => orchestr
       try { Promise.resolve(onTrace(session, result.trace, { turn: payload.turn, step: payload.step, question: userText })).catch(() => {}); }
       catch { /* Observability must not alter execution or model context. */ }
     }
-    const additions = [resident?.context, result.context].filter(Boolean).map(createMessage);
-    if (!additions.length) return decision;
-    return { ...decision, messages: [...decision.messages, ...additions] };
+    // Pass what each injection WAS, not only its text: the Chat UI renders a
+    // `recall` source through its referenced-session view and falls back to
+    // showing raw JSON when the source carries no `references`. A reader then
+    // sees the untrusted-envelope JSON instead of "recalled N memories".
+    const executions = Array.isArray(result.trace?.executions) ? result.trace.executions : [];
+    const recalled = executions.filter(row => row.operation !== 'write');
+    const hits = recalled.reduce((sum, row) => sum + (Number.isFinite(row.response?.hitCount) ? row.response.hitCount : 0), 0);
+    const additions = [
+      resident?.context ? createMessage(resident.context, { label: '常驻记忆（USER / MEMORY）', count: Object.values(resident.resident ?? {}).filter(Boolean).length, truncated: false }) : undefined,
+      result.context ? createMessage(result.context, { label: `MemoryPilot 召回（${recalled.length} 个库，${hits} 条）`, count: hits, truncated: result.trace?.injection?.truncated === true, decision: decisionForLog(result.trace, { turn: payload.turn, step: payload.step, question: userText }) }) : undefined,
+    ].filter(Boolean);
+    // A judgment can be worth making whether or not memory was involved: the
+    // command-safety point always runs, and its verdict may be appended as a note
+    // so the model sees the caution where it acts. It must not be gated behind a
+    // memory hit, or a turn needing no recall would silently skip it.
+    let cautionMessages = [];
+    try {
+      // `session`, never `payload.agent`: the Agent wraps the Session but is not
+      // one. Every consumer of this hook reads `session.header.cwd`, so passing the
+      // Agent made the very first read throw, and the throw surfaced as an opaque
+      // turn error ("Cannot read properties of undefined (reading 'turn')").
+      const judged = await safety(session, { text: userText, turn: payload.turn, step: payload.step, decide: decisionForLog });
+      if (disposed || payload.signal?.aborted) return decision;
+      if (judged) {
+        if (judged.trace) {
+          try { Promise.resolve(onTrace(session, judged.trace, { turn: payload.turn, step: payload.step, question: userText })).catch(() => {}); }
+          catch { /* Observability must not alter execution. */ }
+        }
+        if (judged.caution) cautionMessages = [createMessage(judged.caution, { label: judged.label ?? '决策提示', count: 1, truncated: false, ...(judged.record ? { decision: judged.record } : {}) })];
+      }
+    } catch { onError('safety_decision_failed'); }
+    const all = [...additions, ...cautionMessages];
+    if (!all.length) return decision;
+    return { ...decision, messages: [...decision.messages, ...all] };
   };
   const agentListeners = new Map();
   const registrations = [ctx.on('agent/created', ({ agent }) => {
     if (!agent?.ctx || agentListeners.has(agent)) return;
-    let admitted = false;
+    // Which turn has already been admitted. The agent instance outlives a single
+    // turn — the same agent handles every turn of a conversation — so a boolean
+    // here meant only the FIRST message of a Session was ever evaluated; every
+    // follow-up was skipped silently, so the decision log showed one entry for a
+    // four-turn conversation and memory never ran again.
+    const admittedTurns = new Set();
     const off = agent.ctx.on('agent/pre-step', async (payload, next) => {
       if (payload.step !== 1) return next();
-      // The admission decision itself is synchronous with respect to this
-      // handler's await points: a user message in the triggering batch admits
-      // the session and no later batch can race the flag within one step.
-      if (!admitted) {
+      // Within one turn the decision runs once: later steps of the same turn
+      // must not repeat retrieval, but every new turn must run it again.
+      const turnKey = key(agent.session, payload.turn);
+      if (!admittedTurns.has(turnKey)) {
         const result = await preStep(payload, next);
-        if (payload.messages?.some(message => message.source?.kind === 'user')) admitted = true;
+        if (payload.messages?.some(message => message.source?.kind === 'user')) admittedTurns.add(turnKey);
         return result;
       }
       const decision = await next();
       if (decision.kind === 'enter' && !payload.signal?.aborted && acceptsSession(agent.session)) {
         const userText = (payload.messages || []).filter(message => message.source?.kind === 'user')
           .map(message => text(message.content)).join('\n').slice(0, maxTextChars);
-        if (userText) turns.set(key(agent.session, payload.turn), { userText, assistantText: '', session: agent.session, turn: payload.turn });
+        if (userText) turns.set(turnKey, { userText, assistantText: '', session: agent.session, turn: payload.turn });
       }
       return decision;
     });
@@ -90,11 +194,20 @@ export function attachHost(ctx, { orchestrator, orchestratorFor = () => orchestr
     if (event.type === 'turn/end') {
       turns.delete(id);
       if (!captureOn() || event.data?.reason === 'error' || event.data?.reason === 'aborted') return;
+      const captureStartedAt = performance.now();
       const task = typeof captureTurn === 'function'
         ? Promise.resolve(captureTurn({ session, turn, userText: state.userText, assistantText: state.assistantText, reason: event.data?.reason }, { budgetMs: captureBudget() }))
         : safeRun(session, describe(session, turn, 'turn_end', JSON.stringify({ user: state.userText, assistant: state.assistantText, evidenceStatus: 'conversation-only, not independently verified' })), { budgetMs: captureBudget() });
       pending.add(task);
-      void task.finally(() => pending.delete(task));
+      // Capture is silent by design — it runs after the answer — but silence is
+      // indistinguishable from failure. Publish a write row so the decision log
+      // can show that this turn was stored, and where.
+      void task.then(settled => {
+        try {
+          Promise.resolve(onTrace(session, captureTrace(settled, { turn, durationMs: Math.max(0, performance.now() - captureStartedAt),
+            question: state.userText, assistantChars: state.assistantText.length }), { turn, step: 0, question: state.userText })).catch(() => {});
+        } catch { /* observability must not alter execution */ }
+      }).catch(() => {}).finally(() => pending.delete(task));
     }
   }), ctx.on('session/disposed', session => {
     for (const [id, state] of turns) if (state.session === session) turns.delete(id);
