@@ -39,9 +39,12 @@ export function createRegistry({ bindings, identities, env = process.env, factor
     const grant = scopes[item.scope] ||= {read:false,write:false};
     grant.read ||= item.read === true; grant.write ||= item.write === true;
   }
+  // Any writable backend that can store a finished turn, not just the global one.
+  // Restricting capture to `global` meant a project repository never received
+  // conversations at all, so project-scoped recall had nothing to find.
   const captureTargets = Object.entries(backends).filter(([id, backend]) => {
     const item = bindings.find(binding => binding.id === id);
-    return item?.scope === 'global' && item.write === true && typeof backend.captureTurn === 'function';
+    return item?.write === true && typeof backend.captureTurn === 'function';
   }).map(([, backend]) => backend);
   return {
     backends, policy: { scopes }, capture: captureTargets.length > 0,

@@ -6,7 +6,7 @@ const descriptor = (value = { enabled: true, decisionKeyEnv: 'KEY', backends: []
   ns: 'dsh-memory-pilot', revision, value, base: {}, user: {}, schema: { type: 'object' }, applies: 'live',
 });
 
-test('remote settings RPC reads only the MemoryPilot redacted descriptor', async () => {
+test('remote settings RPC reads only the MemoryPilot descriptor, redacted apart from declared secrets', async () => {
   const calls = [];
   const settings = {
     writable: true,
@@ -20,7 +20,13 @@ test('remote settings RPC reads only the MemoryPilot redacted descriptor', async
   assert.equal(result.ok, true);
   assert.equal(result.value.ns, 'dsh-memory-pilot');
   assert.equal(result.value.writable, true);
-  assert.deepEqual(calls, [{ redactSecrets: true }]);
+  // The view itself stays redacted — the platform strips every `role('secret')`
+  // field, and that is what the panel renders. Exactly one additional unredacted
+  // read supplies the secret values, because a password box cannot otherwise
+  // display (or re-send) the stored key.
+  assert.deepEqual(calls, [{ redactSecrets: true }, {}]);
+  // Only the fields this plugin declares secret ride along, never the whole row.
+  assert.deepEqual(Object.keys(result.value.secretValues).sort(), ['backends', 'decisionApiKey']);
 });
 
 test('remote settings RPC applies bounded path mutations with revision fencing', async () => {
@@ -205,4 +211,49 @@ test('resident write refusals report the real cause instead of always claiming a
   const soulRefusal = createSettingsRpcHandler({ writable: true, describe: () => [descriptor()] }, { residentMemory: refuse('Resident memory content exceeds limit') });
   const soul = await soulRefusal('resident-put', { target: 'soul', content: 'x', revision: 'r1' });
   assert.match(soul.error.message, /limit 12000 characters/);
+});
+
+test('a saved decision key is returned to the panel instead of an empty slot', async () => {
+  // The platform deletes every `role('secret')` field before a settings view
+  // reaches a browser, so `value` carries no key. The panel therefore rendered an
+  // empty password box right after a successful save, and the user concluded the
+  // save had failed. The unredacted value must ride alongside the view.
+  let redacted = true;
+  const settings = {
+    writable: true,
+    describe(options) {
+      redacted = options?.redactSecrets === true;
+      const value = { enabled: true, backends: [{ id: 'memos-global', type: 'memos-bridge', apiKey: 'hs-STORED' }] };
+      if (redacted) delete value.decisionApiKey;
+      else value.decisionApiKey = 'clef-STORED';
+      return [{ ...descriptor(value), secrets: [{ path: ['decisionApiKey'], set: true }] }];
+    },
+  };
+  const rpc = createSettingsRpcHandler(settings);
+  const result = await rpc('get', {});
+  assert.equal(result.ok, true);
+  // The rendered view is still the redacted one.
+  assert.equal(result.value.value.decisionApiKey, undefined);
+  // ...but the panel can show (and re-send) the stored values.
+  assert.equal(result.value.secretValues.decisionApiKey, 'clef-STORED');
+  assert.equal(result.value.secretValues.backends['memos-global'], 'hs-STORED');
+});
+
+test('the connection test falls back to the stored key when the draft carries none', async () => {
+  // The probe runs against the DRAFT config. A draft built from a redacted view
+  // has no key, so the probe sent an unauthenticated request and reported an
+  // error for a perfectly healthy endpoint.
+  const settings = {
+    writable: true,
+    describe: () => [descriptor({ enabled: true, decisionApiKey: 'clef-STORED', backends: [{ id: 'hs', type: 'hindsight', apiKey: 'hs-STORED' }] })],
+  };
+  const seen = [];
+  const rpc = createSettingsRpcHandler(settings, { testConnection: async payload => { seen.push(payload); return { ok: true, detail: 'ok' }; } });
+  await rpc('test', { kind: 'decision', config: { decisionBaseUrl: 'http://x/v1', decisionModel: 'm' } });
+  await rpc('test', { kind: 'system', config: { id: 'hs', type: 'hindsight', baseUrl: 'http://y', apiKey: '' } });
+  assert.equal(seen[0].config.decisionApiKey, 'clef-STORED', 'a keyless decision draft must reuse the stored key');
+  assert.equal(seen[1].config.apiKey, 'hs-STORED', 'a keyless system draft must reuse the stored key');
+  // A key the user actually typed still wins over the stored one.
+  await rpc('test', { kind: 'decision', config: { decisionBaseUrl: 'http://x/v1', decisionModel: 'm', decisionApiKey: 'typed' } });
+  assert.equal(seen[2].config.decisionApiKey, 'typed');
 });

@@ -23,6 +23,8 @@ test('decision probe actually issues a network request (regression: 0 ms fake su
   const fetchImpl = async (url, options) => {
     const body = JSON.parse(options.body);
     calls.push({ url, body });
+    // The batch capability probe asks the batch endpoint to decide one request.
+    if (url.endsWith('/systemone/batch')) return { responses: body.requests.map(item => systemOneReply(item.questions)) };
     return systemOneReply(body.questions);
   };
   const result = await testDecisionConnection(
@@ -30,7 +32,7 @@ test('decision probe actually issues a network request (regression: 0 ms fake su
     { fetchImpl, timeoutMs: 5000 });
   // A probe that short-circuits on an empty capability list never calls fetch,
   // which is exactly how a dead endpoint used to report "connected, 0 ms".
-  assert.equal(calls.length, 1, 'probe must hit the endpoint');
+  assert.equal(calls.filter(call => call.url.endsWith('/systemone')).length, 1, 'probe must hit the decision endpoint');
   assert.equal(result.ok, true);
   assert.match(calls[0].url, /\/systemone$/);
   // The state must carry real capabilities, not an empty array.

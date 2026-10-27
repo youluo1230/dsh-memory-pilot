@@ -16,6 +16,47 @@ function loadClient() {
   return definition.factory((id) => id === 'react' ? fakeReact : { jsx() {} });
 }
 
+
+/** Render the decision log and flatten its text, so tests assert what a reader
+ * sees rather than which strings appear in the source. */
+function renderLog(entries) {
+  const off = () => {};
+  const calls = [];
+  const fakeReact = {
+    createElement: (type, props, ...children) => ({ type, props, children }),
+    useState: initial => [typeof initial === 'function' ? initial() : initial, () => {}],
+    useEffect: () => {}, useMemo: fn => fn(), useRef: value => ({ current: value }), useCallback: fn => fn, Fragment: 'F',
+  };
+  let definition;
+  vm.runInNewContext(source, {
+    window: { __ModuleLoader__: { load(value) { definition = value; } }, addEventListener() {}, removeEventListener() {} },
+    console, setTimeout, clearTimeout, AbortController,
+  });
+  const client = definition.factory(() => fakeReact);
+  client.apply({
+    locale: { bind: () => key => key, register: () => off },
+    slots: { inject: (name, fn) => fn(), register: (spec, component) => { calls.push({ spec, component }); return {}; } },
+    configForms: { whileServed: () => {}, get: () => ({ getSnapshot: () => ({}), subscribe: () => off, writable: false }) },
+    connection: { rpc: async () => ({}) },
+    uiConversation: { events: { register: () => off } },
+    sessions: { list: { getSnapshot: () => ({ ids: [] }), subscribe: () => off }, binding: () => undefined },
+    effect: fn => fn(),
+  });
+  const view = calls.find(call => call.spec?.name === 'conversation.view');
+  if (!view) throw new Error('the plugin registered no conversation view');
+  const texts = [];
+  const walk = node => {
+    if (node == null || typeof node === 'boolean') return;
+    if (typeof node === 'string' || typeof node === 'number') { texts.push(String(node)); return; }
+    if (Array.isArray(node)) return node.forEach(walk);
+    if (node.type === 'style') return;
+    if (typeof node.type === 'function') return walk(node.type({ ...(node.props || {}), children: node.children }));
+    (node.children || []).forEach(walk);
+  };
+  walk(view.component({ face: { getSnapshot: () => ({ entries }), subscribe: () => off }, t: key => key }));
+  return texts.filter(part => part.trim()).join(' · ');
+}
+
 test('the trajectory row renders one decision trail entry with its questionnaire', () => {
   const client = loadClient();
   // The Trajectory row now reads the Host projection (src/trail.mjs) instead of a
@@ -31,16 +72,22 @@ test('the trajectory row renders one decision trail entry with its questionnaire
     executions: [{ backend: 'memos-global', scope: 'global', operation: 'search', status: 'ok', hitCount: 2, durationMs: 900 }],
     injectedChars: 2048,
   });
-  // What the user asked, which is the whole point of the row.
-  assert.match(text, /问题：帮我看看记忆插件/);
-  // Which decision model ran and what it was asked, with the chosen levels.
+  // What the user asked, which is the whole point of the row. It is quoted so
+  // it reads as the user's own text rather than a field dump.
+  assert.match(text, /帮我看看记忆插件/);
+  // Which decision model ran.
   assert.match(text, /systemone\/clef-flash/);
-  assert.match(text, /recall_gate → memory \(70%\)/);
-  assert.match(text, /scope_global → query \(85%\)/);
-  // What was authorized and what actually happened.
-  assert.match(text, /已授权动作/);
-  assert.match(text, /global · memos-global · search/);
-  assert.match(text, /2 命中/);
+  // Questions are named by the decision they stand for, and options by what they
+  // chose — not by the internal questionnaire ids.
+  assert.match(text, /要不要查记忆：要查 · 70%/);
+  assert.doesNotMatch(text, /recall_gate/);
+  // The row opens by answering "was memory consulted, and did it work?" — the
+  // only question a reader has. Internal ids never appear.
+  assert.match(text, /已调用记忆：查询 1 个库，命中 2 条/);
+  assert.doesNotMatch(text, /memos-global/);
+  // What was authorized, in words.
+  assert.match(text, /检索 · 全局 · MemOS/);
+  assert.match(text, /命中 2 条/);
   assert.match(text, /2,048 字符/);
   assert.equal(client.TRAIL_KEY, 'memoryPilotTrail');
 });
@@ -56,7 +103,7 @@ test('a noop decision explains itself instead of showing an empty action list', 
   });
   assert.match(text, /无需记忆/);
   assert.match(text, /模型判定无需记忆操作/);
-  assert.match(text, /recall_gate → none/);
+  assert.match(text, /要不要查记忆：不查/);
 });
 
 test('noop trajectory marks subordinate answers inactive instead of implying recall ran', () => {
@@ -184,7 +231,9 @@ test('decision tab asks for one key and never mentions environment variables', (
   assert.doesNotMatch(decision, /MEMORY_DECISION_API_KEY/);
   // The field still writes the literal key the runtime resolves.
   assert.match(decision, /onChange: set\("decisionApiKey"\)/);
-  assert.match(decision, /type: "password"/);
+  // The key is rendered by SecretInput, which owns the masked/reveal behaviour
+  // and shows whether a key is already stored (see the secret-field tests).
+  assert.match(decision, /h\(SecretInput, \{ value: draft\.decisionApiKey, stored: storedSecret/);
 });
 
 test('ordinary UI never renders a scopeId field and supports automatic identity overrides', () => {
@@ -420,4 +469,191 @@ test('the trajectory definition anchors a decision to its step and skips steps w
 
   // Only step starts are anchors; a stray event must not claim the target.
   assert.equal(registered.match({ type: 'assistant/message', seq: 44, data: {} }), null);
+});
+
+test('saving an unrelated field never clears a stored secret', () => {
+  // The regression: the settings view omits every `role('secret')` field, the
+  // draft was seeded empty, and the save wrote that empty string back over a
+  // key that was stored correctly. The panel then re-read "no key", so the save
+  // looked like it had never happened.
+  const client = loadClient();
+  const original = { enabled: false, decisionBaseUrl: 'http://x/v1', backends: [{ id: 'memos-global', type: 'memos-bridge', apiKey: '' }] };
+  const draft = { enabled: true, decisionBaseUrl: 'http://x/v1', decisionApiKey: '', backends: [{ id: 'memos-global', type: 'memos-bridge', apiKey: '' }] };
+  const ops = client.savePlan({
+    draft, original, storedSecret: 'clef-STORED', storedSystemSecrets: { 'memos-global': 'hs-STORED' }, backends: draft.backends,
+  });
+  // Only the switch changed.
+  // The client module runs in its own vm context, so its arrays/objects carry
+  // that realm's prototypes; compare JSON to keep the assertion about content.
+  assert.equal(JSON.stringify(ops), JSON.stringify([{ op: 'set', path: ['enabled'], value: true }]),
+    'an untouched secret must not be written at all');
+});
+
+test('a freshly typed key is saved, and the stored key restores into the draft', () => {
+  const client = loadClient();
+  const original = { backends: [] };
+  const typed = client.savePlan({
+    draft: { decisionApiKey: 'typed-KEY', backends: [] },
+    original, storedSecret: 'clef-STORED', storedSystemSecrets: {}, backends: [],
+  });
+  assert.equal(JSON.stringify(typed), JSON.stringify([{ op: 'set', path: ['decisionApiKey'], value: 'typed-KEY' }]));
+
+  // Re-typing the same key is not a change, so a save stays a no-op.
+  const unchanged = client.savePlan({
+    draft: { decisionApiKey: 'clef-STORED', backends: [] },
+    original, storedSecret: 'clef-STORED', storedSystemSecrets: {}, backends: [],
+  });
+  assert.equal(JSON.stringify(unchanged), '[]');
+});
+
+test('a backend secret the draft never received is preserved through a save', () => {
+  const client = loadClient();
+  const original = { backends: [{ id: 'hs-main', type: 'hindsight', apiKey: '', baseUrl: 'http://old' }] };
+  const ops = client.savePlan({
+    draft: { backends: [{ id: 'hs-main', type: 'hindsight', apiKey: '', baseUrl: 'http://new' }] },
+    original,
+    storedSecret: '', storedSystemSecrets: { 'hs-main': 'hs-STORED' },
+    backends: [{ id: 'hs-main', type: 'hindsight', apiKey: '', baseUrl: 'http://new' }],
+  });
+  assert.equal(ops.length, 1);
+  assert.equal(ops[0].path[0], 'backends');
+  assert.equal(ops[0].value[0].baseUrl, 'http://new');
+  assert.equal(ops[0].value[0].apiKey, 'hs-STORED', 'the stored backend key must survive');
+});
+
+test('the loopback settings form surfaces stored secrets too', async () => {
+  // Regression: only the remote form carried `secretValues`. The local UI — the
+  // path a normal user always takes — read the platform's native config form,
+  // whose view is redacted, so a stored key rendered as an empty password box.
+  assert.match(source, /const withSecrets = \(\) => \{[\s\S]*?secretValues \? \{ secretValues \} : \{\}/);
+  assert.match(source, /ctx\.connection\.rpc\.call\(SETTINGS_RPC_CHANNEL, "get", \{\}\)/);
+  // A save must refresh them, or the box stays empty right after saving.
+  assert.match(source, /mutate: async ops => \{ const ok = await nativeForm\.mutate\(ops\); await loadSecrets\(\); return ok; \}/);
+});
+
+test('the trail row states plainly whether memory was actually consulted', () => {
+  const client = loadClient();
+  const base = { id: 's:1:1:retrieval', turn: 1, step: 1, question: '你知道我是谁吗？', kind: 'retrieval',
+    protocol: 'systemone', model: 'clef-flash', decisionDurationMs: 735, totalDurationMs: 4644,
+    answers: [], actions: [], executions: [], injectedChars: 0 };
+
+  // Consulted and found something: say so up front, with the backend named.
+  const hit = client.trailText({ ...base, status: 'ok',
+    answers: [{ name: 'recall_gate', choice: 'memory', confidence: 0.66 },
+              { name: 'scope_global', choice: 'query', confidence: 0.71 },
+              { name: 'scope_project', choice: 'skip', confidence: 0.96 }],
+    actions: [{ backend: 'legacy-memos-global', scope: 'global', operation: 'search' }],
+    executions: [{ backend: 'legacy-memos-global', scope: 'global', operation: 'search', status: 'ok', hitCount: 2, durationMs: 3906 }],
+    injectedChars: 2183 });
+  assert.match(hit.split('\n')[0], /已调用记忆：查询 1 个库，命中 2 条/);
+  assert.match(hit, /MemOS（全局）：命中 2 条/);
+  // Two scope questions must not both read "查哪个范围" — the store is named.
+  assert.match(hit, /全局记忆：查/);
+  assert.match(hit, /项目记忆：不查/);
+  assert.doesNotMatch(hit, /legacy-/);
+
+  // Judged unnecessary: the row must say that, not stay blank.
+  const skipped = client.trailText({ ...base, status: 'noop',
+    answers: [{ name: 'recall_gate', choice: 'none', confidence: 0.9 }] });
+  assert.match(skipped.split('\n')[0], /未调用记忆/);
+
+  // Asked but nothing came back: distinguishable from "not asked".
+  const empty = client.trailText({ ...base, status: 'ok',
+    actions: [{ backend: 'hs-repository', scope: 'project', operation: 'search' }],
+    executions: [{ backend: 'hs-repository', scope: 'project', operation: 'search', status: 'ok', hitCount: 0, durationMs: 900 }] });
+  assert.match(empty.split('\n')[0], /已调用记忆：查询 1 个库，命中 0 条/);
+  assert.match(empty, /Hindsight（项目）：命中 0 条/);
+});
+
+test('the trail row shows what a read actually returned, not just a hit count', () => {
+  // A bare "2 命中" cannot answer the reader's real question: were those hits
+  // relevant? The excerpt has to travel with the row.
+  const client = loadClient();
+  const text = client.trailText({
+    id: 's:1:1:retrieval', turn: 1, step: 1, question: '你还记得我们之前做过什么吗',
+    kind: 'retrieval', status: 'ok', protocol: 'systemone', model: 'clef-flash',
+    decisionDurationMs: 959, totalDurationMs: 3000, answers: [], injectedChars: 1268,
+    actions: [{ backend: 'legacy-memos-global', scope: 'global', operation: 'search' }],
+    executions: [{ backend: 'legacy-memos-global', scope: 'global', operation: 'search',
+      status: 'ok', hitCount: 2, durationMs: 1983, preview: '[user] 你知道我是谁吗？ [assistant] 我记得你，阿宝。' }],
+  });
+  assert.match(text, /命中 2 条/);
+  assert.match(text, /> \[user\] 你知道我是谁吗？/);
+});
+
+test('the plugin registers a decision-log view beside chat and trajectory', async () => {
+  // The Trajectory row explains one step. Tuning the gate needs the other
+  // question: what has the decision model been asked across the whole session,
+  // and what did it choose. That belongs in its own view, not smuggled into the
+  // Trajectory, so it must be registered on the same slot the built-in views use.
+  const source = await readFile(new URL('../lib/client.js', import.meta.url), 'utf8');
+  assert.match(source, /ctx\.slots\.inject\("conversation\.view"/);
+  assert.match(source, /id:\s*"memory-pilot"/);
+  // A sibling, not a replacement: a higher order than trajectory keeps it beside
+  // the built-in views rather than ahead of them.
+  const registration = source.match(/name:\s*"conversation\.view"[\s\S]{0,200}?order:\s*(\d+)/);
+  assert.ok(registration, 'the view must declare an order');
+  assert.ok(Number(registration[1]) > 0, 'must not take the first tab');
+  // The panel must be able to say "nothing ran", which a bare hit count cannot.
+  assert.match(source, /未调用记忆/);
+});
+
+test('the decision log presents rows in a table with an operation type', async () => {
+  // A prose blob forced the reader to parse sentences to find out whether memory
+  // was queried or written. The log is a table: one row per decision, a visible
+  // operation type, a verdict, and the options that were not chosen.
+  const source = await readFile(new URL('../lib/client.js', import.meta.url), 'utf8');
+  assert.match(source, /className: "mp-table"/);
+  // Rows are classified by the judging subject, so every subject the plugin
+  // declares must have a label; an unlabelled one would render as an internal id.
+  for (const subject of ['memory.read', 'memory.write', 'command.safety']) {
+    assert.ok(source.includes(`"${subject}"`), `the log must name ${subject}`);
+  }
+  // The unchosen options are part of the record.
+  assert.match(source, /questionOptions/);
+  assert.match(source, /可选/);
+});
+
+test('the log classifies a row by the concern that judged it, not by memory verbs', () => {
+  // A command-safety decision touches no memory. Classified by operations it would
+  // read as "未调用"; it must read as its own kind. This renders the real view
+  // rather than matching source text, because the classification is behaviour.
+  const rows = [
+    { id: 'a', subject: 'command.safety', turn: 3, step: 1, question: 'rm -rf build/', status: 'ok',
+      answers: [{ name: 'risk', choice: 'confirm', confidence: 0.9 }], questionOptions: { risk: ['safe', 'confirm'] },
+      actions: [], executions: [], injectedChars: 0, kind: 'tool', protocol: 's', model: 'm',
+      decisionDurationMs: 90, totalDurationMs: 90, questions: ['risk'] },
+    { id: 'b', subject: 'browser.click', turn: 4, step: 1, question: '点这个按钮', status: 'ok',
+      answers: [], actions: [], executions: [], injectedChars: 0, kind: 'tool', protocol: 's', model: 'm',
+      decisionDurationMs: 80, totalDurationMs: 80, questions: [] },
+  ];
+  const text = renderLog(rows);
+  assert.match(text, /命令安全/, 'a non-memory subject must be named');
+  assert.match(text, /先确认/, 'its answer must be shown, not "未执行"');
+  // A subject with no label is shown as other, never mis-filed as a memory read.
+  assert.match(text, /其他判断/);
+  assert.doesNotMatch(text, /记忆查询 1/);
+});
+
+test('a command-safety row states its verdict instead of "未执行"', () => {
+  // "未执行" was true but useless: the judgment did produce a result, it just had
+  // no memory request behind it.
+  const text = renderLog([{ id: 'c', subject: 'command.safety', turn: 1, step: 1, question: 'rm x',
+    status: 'ok', answers: [{ name: 'risk', choice: 'safe', confidence: 0.8 }],
+    questionOptions: { risk: ['safe', 'confirm'] }, actions: [], executions: [], injectedChars: 0,
+    kind: 'tool', protocol: 's', model: 'm', decisionDurationMs: 90, totalDurationMs: 90, questions: ['risk'] }]);
+  assert.doesNotMatch(text, /未执行/);
+  assert.match(text, /可执行/);
+});
+
+test('the settings page exposes judgement capability and batch support', async () => {
+  // A user cannot tune what they cannot see. The card must name each built-in
+  // point and show whether batching was detected, because both change behaviour.
+  const text = await readFile(new URL('../lib/client.js', import.meta.url), 'utf8');
+  assert.match(text, /决策记录/, 'the log tab must be labelled');
+  assert.match(text, /判断能力/, 'settings must have a capability section');
+  for (const label of ['记忆查询', '记忆录入', '命令安全']) assert.ok(text.includes(label), `${label} must be shown`);
+  assert.match(text, /自定义判断点/);
+  // Batch capability is reported by the connection test, so the UI must surface it.
+  assert.match(text, /questionOptions/);
 });

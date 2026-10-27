@@ -136,7 +136,15 @@ test('noncooperative decision and execution are bounded and late output never in
     assert.equal(signal.aborted, true);
     release(phase === 'decision' ? { actions: [read()] } : { text: 'late malicious text' });
     await new Promise(resolve => setImmediate(resolve));
-    assert.deepEqual(result, { context: '', results: [], status: 'timeout' });
+    // A timeout must still reach the Trajectory: a silent timeout is
+    // indistinguishable from a plugin that never ran. Nothing else may leak —
+    // no partial context and no late output.
+    assert.equal(result.context, '');
+    assert.deepEqual(result.results, []);
+    assert.equal(result.status, 'timeout');
+    assert.equal(result.trace?.status, 'timeout');
+    assert.equal(result.trace?.reason, 'budget-exhausted');
+    assert.deepEqual(result.trace?.executions, []);
     assert.equal(o.calls.length, 0);
     assert.equal(executions, phase === 'execution' ? 1 : 0);
   }
@@ -329,4 +337,46 @@ test('per-run budget override lets a slow capture write finish; the default budg
  const loose=createOrchestrator({decision,backends,policy,budgetMs:100});
  const result=await loose.run({type:'turn_end',id:'e2',sessionId:'s2',text:'q',projectId:'p'},{budgetMs:5000});
  assert.equal(result.status,'ok');assert.equal(result.results[0].status,'ok');
+});
+
+test('every turn publishes a trace the Trajectory can render, even with nothing to do', async () => {
+  // The regression: a turn with no usable backend (or an exhausted budget)
+  // returned a bare result with no trace, so the Trajectory showed nothing at
+  // all and the user concluded the plugin never ran. A blank row is worse than
+  // a row saying why nothing happened.
+  const configuration = setup();
+  const idle = createOrchestrator({ decision: { decide: async () => ({ actions: [] }) },
+    backends: {}, policy: { scopes: {} }, budgetMs: 1000, onAudit: () => {} });
+  const result = await idle.run(event());
+  assert.equal(result.status, 'noop');
+  assert.equal(result.trace?.status, 'noop');
+  assert.equal(result.trace?.reason, 'no-capabilities');
+  // The row still identifies what was being evaluated.
+  assert.equal(result.trace?.question, 'I prefer concise answers.');
+  // A decision model was never contacted, and the row says so honestly.
+  assert.equal(result.trace?.decision.protocol, 'none');
+
+  // An ordinary no-op decision also carries the question.
+  const quiet = await configuration.run(event());
+  assert.equal(quiet.status, 'noop');
+  assert.equal(quiet.trace?.question, 'I prefer concise answers.');
+});
+
+test('the trace identifies the user text a decision actually saw', async () => {
+  const o = setup([read()]);
+  const result = await o.run(event());
+  // Without this the Trajectory row could not say what was asked, which is the
+  // whole point of showing a decision at all.
+  assert.equal(result.trace.question, 'I prefer concise answers.');
+  assert.equal(result.trace.kind, 'retrieval');
+});
+
+test('a write decision publishes its authorized action and execution to the trace', async () => {
+  const o = setup([write()], { budgetMs: 5000 });
+  const result = await o.run(event({ type: 'checkpoint', text: 'I prefer concise answers.' }));
+  assert.equal(result.trace.plan.actions.length, 1);
+  assert.equal(result.trace.plan.actions[0].operation, 'write');
+  assert.equal(result.trace.executions.length, 1);
+  assert.equal(result.trace.executions[0].operation, 'write');
+  assert.equal(result.trace.executions[0].response.status, 'ok');
 });

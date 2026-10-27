@@ -6,6 +6,7 @@ import { acceptsWorkspacePath, bindingsForIdentity, detectIdentity, matchWorkspa
 import { createOpenAICompatibleDecision, createSystemOneDecision } from './adapters.mjs';
 import { createRegistry } from './registry.mjs';
 import { attachHost } from './host.mjs';
+import { createSafetyJudge, loadDecisionPoints } from './decision-points.mjs';
 import { installSettingsRpc } from './settings-rpc.mjs';
 import { testDecisionConnection, testSystemConnection } from './connection-test.mjs';
 import { registerMemoryTools } from './tools.mjs';
@@ -41,7 +42,9 @@ export const name = 'dsh-memory-pilot';
 // Exported so the gate can be tested without constructing a live backend.
 export function shouldCapture({ disposed = false, enabled = false, backends = [] } = {}) {
   if (disposed || enabled !== true) return false;
-  return Array.isArray(backends) && backends.some(binding => binding?.scope === 'global' && binding.write === true);
+  // Any writable backend counts: a project repository stores turns too, and
+  // requiring `global` kept project stores permanently empty.
+  return Array.isArray(backends) && backends.some(binding => binding?.write === true);
 }
 
 export const inject = ['connection', 'webServer', 'settings', 'workspaceRegistry', 'tools', 'systemPrompt'];
@@ -64,6 +67,12 @@ export const Config = Schema.object({
   decisionBaseUrl: Schema.string().default('').volatile(),
   decisionModel: Schema.string().default('').volatile(),
   decisionProtocol: Schema.union(['systemone', 'openai']).default('systemone').volatile(),
+  // On by default: the caution note is advisory and cheap, so requiring an opt-in
+  // would mean most users never see it. A user who finds it noisy turns it off.
+  safetyEnabled: Schema.boolean().default(true),
+  // User-declared decision points. Validated with the same rules as the built-in
+  // ones, so a broken declaration fails at load instead of judging nonsense.
+  decisionPoints: Schema.any().default([]),
   decisionKeyEnv: Schema.string().default('MEMORY_DECISION_API_KEY').volatile(),
   // Literal key fallback. Many deployments cannot inject env vars into the DSH
   // service, so the settings panel must be able to hold the key itself. When
@@ -357,9 +366,52 @@ export function apply(ctx, config) {
     },
     captureTurn: turn => runtimeFor(turn.session)?.registry?.captureTurn(turn),
     captureBudgetMs: () => current().captureBudgetMs ?? 60000,
+    // The command-safety point runs on every turn, independent of whether memory
+    // was consulted. It gets a short leash of its own: safety advice that arrives
+    // after the model already acted is worth nothing, so a slow judgment is
+    // dropped rather than awaited.
+    safety: (session, input) => {
+      const runtime = runtimeFor(session);
+      if (!runtime?.decision) return undefined;
+      // A malformed user point must not break every turn, so validation failure
+      // degrades to running only the built-in points.
+      let points = [];
+      try {
+        const declared = current().decisionPoints;
+        if (Array.isArray(declared) && declared.length) points = loadDecisionPoints(declared);
+      } catch { log('warn', 'MemoryPilot decision_point_invalid'); }
+      const judge = createSafetyJudge({
+        decision: runtime.decision,
+        points,
+        enabled: () => current().safetyEnabled !== false && current().decisionEnabled !== false,
+        timeoutMs: Math.min(4000, Number(current().decisionTimeoutMs) || 4000),
+      });
+      return judge(session, input);
+    },
     acceptsSession,
     identity: identityFor,
-    createMessage: text => createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'plugin:dsh-memory-pilot', form: 'recall' } }),
+    // `references` is what makes the Chat UI render a `recall` source as a
+    // readable "recalled from …" row. Without it the surface falls back to
+    // opaque, i.e. the raw untrusted-envelope JSON, which is what a user saw
+    // instead of a memory summary.
+    createMessage: (text, meta = {}) => createUserMessage({
+      content: [{ type: 'text', text }],
+      source: {
+        kind: 'plugin:dsh-memory-pilot', form: 'recall',
+        references: [{
+          label: typeof meta.label === 'string' && meta.label ? meta.label : 'MemoryPilot 召回',
+          retainedMessages: Number.isSafeInteger(meta.count) ? meta.count : 0,
+          omittedMessages: 0,
+          truncated: meta.truncated === true,
+        }],
+        // The decision itself, carried on the injected message so it lands in the
+        // Session log. The projection only held decisions in an in-memory pending
+        // table, so a restart rebuilt the projection from the log, found no
+        // pending entries, and showed an empty decision log for sessions whose
+        // decisions had already happened.
+        ...(meta.decision && typeof meta.decision === 'object' ? { decision: meta.decision } : {}),
+      },
+    }),
     // rc.2 read path (dsh-session-persistence-jsonl validateStoredEvents) refuses any
     // event type outside its built-in vocabulary unless marked ignorable, and rc.2
     // append() offers no way to set that marker — appending a custom type here would
@@ -385,7 +437,9 @@ export function apply(ctx, config) {
               id: `${session?.id ?? 'session'}:${location.turn ?? 0}:${location.step ?? 0}:${trace.kind ?? 'decision'}`,
               turn: location.turn,
               step: location.step,
-              question: trace.question ?? '',
+              // The orchestrator records the exact text its decision saw; the
+              // step's user text is a fallback for traces that predate that.
+              question: trace.question ?? location.question ?? '',
             }),
           });
         } catch { /* observability must not alter execution */ }

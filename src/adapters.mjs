@@ -125,13 +125,69 @@ export function createOpenAICompatibleDecision({ baseUrl, model, apiKey, fetchIm
 /** Jev/SystemOne chooses only among capabilities supplied by the core. Criteria
  * use local opaque ids so provider output can never directly control action fields.
  */
+// The retention questionnaire: should this message be stored, and where. Shared
+// by the retrieval path and the retention-only path so both ask identical
+// questions — reading and writing are independent decisions about one message.
+function addRetentionQuestions(questions, writes) {
+  questions.retention_gate = { type: 'choice', instructions: 'Independent of whether anything was read: decide whether this message contains something durable worth storing. Judge the content, not phrases such as remember this. Reject unrelated, ephemeral, duplicated, speculative, sensitive, or operational noise.', criteria: {
+    discard: 'Do not retain: greetings, acknowledgements, thanks, transient status, this-run plans or progress, raw tool/log output, secrets, unverified speculation, generic public knowledge, or chit-chat with no durable content. Do NOT discard merely because the message is phrased as conversation — a correction stated conversationally is still a correction.',
+    retain: 'Retain: (a) an explicit stable preference or instruction ("叫我阿宝", "以后用 pnpm"); (b) a correction — the user says the assistant remembered something WRONG and states what is actually true, including replace/remove/change wording ("不对", "其实不是", "已经不用了", "都卸载了", "换成了", "把这个忘掉"); (c) a durable project fact, constraint, or setup detail; (d) a confirmed decision with its rationale; (e) a verified milestone. Judge by whether a future session would be wrong without it — a correction almost always qualifies, because the wrong fact is presumably already stored.',
+  } };
+  for (const scope of SCOPES) if (writes.some(candidate => candidate.scope === scope)) {
+    const meaning = {
+      global: 'cross-workspace user preferences, identity, enduring instructions, and project portfolio',
+      workspace: 'durable facts shared by repositories in this workspace',
+      project: 'durable decisions, constraints, milestones, and reusable findings for the current repository',
+      personal: 'private enduring user preferences and facts',
+    }[scope];
+    questions[`write_scope_${scope}`] = { type: 'choice', instructions: `If retention_gate chooses retain, decide whether the content belongs in ${scope} memory: ${meaning}`, criteria: { skip: `The content does not belong in ${scope} memory.`, write: `Retain it in ${scope} memory because it is ${meaning}.` } };
+  }
+}
+
 export function createSystemOneDecision({ baseUrl, model, apiKey, fetchImpl = globalThis.fetch, timeoutMs = 15_000 }) {
   const url = `${endpoint(baseUrl)}/systemone`;
   text(model, 'model');
   if (typeof fetchImpl !== 'function') throw new TypeError('fetchImpl is required');
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 2_147_483_647) throw new TypeError('Invalid timeoutMs');
   const ask = async (state, questions, signal) => post(fetchImpl, url, apiKey, { model, state: JSON.stringify(state), questions }, signal);
+
+  // The service supports a batch endpoint, but a deployment does not have to
+  // expose it: a proxy may whitelist only /systemone. Probe once, cache the
+  // answer, and fall back to per-call requests. Falling back is a normal path,
+  // not an error, so a failed probe is silent.
+  const batchUrl = `${endpoint(baseUrl)}/systemone/batch`;
+  let batchSupport;
+  const supportsBatch = async signal => {
+    if (batchSupport !== undefined) return batchSupport;
+    try {
+      const probe = await post(fetchImpl, batchUrl, apiKey, {
+        requests: [{ id: 'probe', state: JSON.stringify({ probe: true }), questions: { probe: { type: 'choice', instructions: 'Choose either.', criteria: { a: 'First option.', b: 'Second option.' } } } }],
+      }, signal);
+      batchSupport = Array.isArray(probe?.responses) && probe.responses.length === 1;
+    } catch (error) {
+      checkAbort(signal);
+      batchSupport = false;
+    }
+    return batchSupport;
+  };
+
   return Object.freeze({
+    supportsBatch,
+    /** Run several independent decisions in one request. Returns results in order;
+     * unsupported deployments fall back to sequential single calls. */
+    async decideBatch(requests, { signal } = {}) {
+      if (!Array.isArray(requests) || !requests.length) return [];
+      if (!(await supportsBatch(signal))) {
+        const out = [];
+        for (const item of requests) out.push(await post(fetchImpl, url, apiKey, { model, state: JSON.stringify(item.state), questions: item.questions }, signal));
+        return out;
+      }
+      const response = await post(fetchImpl, batchUrl, apiKey, {
+        requests: requests.map((item, index) => ({ id: String(item.id ?? index), state: JSON.stringify(item.state), questions: item.questions })),
+      }, signal);
+      if (!Array.isArray(response?.responses) || response.responses.length !== requests.length) throw new Error('Invalid SystemOne batch response');
+      return response.responses;
+    },
     async decideRetention(input, { signal } = {}) {
       checkAbort(signal);
       const event = input?.event;
@@ -183,9 +239,14 @@ export function createSystemOneDecision({ baseUrl, model, apiKey, fetchImpl = gl
         mappings[name] = map;
       };
       if (event.type === 'message' && recalls.length) {
-        questions.recall_gate = { type: 'choice', instructions: 'Can a capable model handle this from the current message, availableContext, environment, and general knowledge? If yes choose none. Choose memory only for a necessary missing cross-session fact.', criteria: {
-          none: 'Current information or general knowledge is sufficient.',
-          memory: 'Handling requires missing history about what this user or project previously did, preferred, instructed, decided, tried, encountered, or why.',
+        // The criteria name concrete shapes rather than abstract "sufficient
+        // information". Measured failures with the abstract wording: "rename this
+        // function" was sent to memory (nothing historical in it) while "how do I
+        // run this project's tests" was not (a project convention it cannot
+        // invent). Naming the shapes moves both in the right direction.
+        questions.recall_gate = { type: 'choice', instructions: 'Decide whether handling this message needs cross-session memory. Judge only the need for stored history; a capable model sees the whole current message already.', criteria: {
+          none: 'No stored history needed. The message is self-contained: it names what to change, or asks for anything the current message, open files, and general knowledge already answer. Includes present-tense actions on named targets ("rename this function", "fix this typo", "run it again"), greetings, thanks, definitions, and translation.',
+          memory: 'Cannot be answered without stored history. (a) It asks about prior work, decisions, or causes: "why did we", "what did we try", "do you remember", "last time", "that bug". (b) OR it asks how THIS project is set up or operated — an established convention with one right answer here that the current message does not state and a general answer cannot supply: "how do I run the tests here", "what model does this use", "where is this configured", "what is our build command". Choose memory for (b) even when the sentence mentions no past event, because the answer is a recorded project fact rather than general knowledge. (c) OR it asks what this user or project is currently working on — "what are we working on", "我们在做什么", "what is this project" — when residentMemory does not already state it.',
         } };
         questions.retrieval_mode = { type: 'choice', instructions: 'If memory is needed, choose lightweight factual recall or deep historical synthesis.', criteria: {
           recall: 'Use latency-bounded retrieval of relevant observations or traces.',
@@ -202,15 +263,9 @@ export function createSystemOneDecision({ baseUrl, model, apiKey, fetchImpl = gl
             skip: `The request does not need ${meaning}.`, query: `Query ${scope} memory because the request needs ${meaning}.`,
           } };
         }
+        if (writes.length) addRetentionQuestions(questions, writes);
       } else if (writes.length) {
-        questions.retention_gate = { type:'choice', instructions:'Controlling decision: decide whether this event contains durable, useful memory. Judge the content, not phrases such as remember this. Reject unrelated, ephemeral, duplicated, speculative, sensitive, or operational noise.', criteria:{
-          discard:'Do not retain: casual conversation, transient status, current-run plans or output, raw tool/log data, secrets, unverified speculation, generic public knowledge, or content unrelated to durable user/project history.',
-          retain:'Retain: an explicit stable preference or instruction, confirmed decision with rationale, durable project fact or constraint, reusable solution, verified milestone, or correction likely to matter in a future session.',
-        }};
-        for (const scope of SCOPES) if (writes.some(candidate=>candidate.scope===scope)) {
-          const meaning={global:'cross-workspace user preferences, identity, enduring instructions, and project portfolio',workspace:'durable facts shared by repositories in this workspace',project:'durable decisions, constraints, milestones, and reusable findings for the current repository',personal:'private enduring user preferences and facts'}[scope];
-          questions[`write_scope_${scope}`]={type:'choice',instructions:`If retention_gate chooses retain, decide whether the content belongs in ${scope} memory: ${meaning}.`,criteria:{skip:`The content does not belong in ${scope} memory.`,write:`Retain it in ${scope} memory because it is ${meaning}.`}};
-        }
+        addRetentionQuestions(questions, writes);
       }
       if (!Object.keys(questions).length) return { actions: [] };
 
@@ -264,19 +319,40 @@ export function createSystemOneDecision({ baseUrl, model, apiKey, fetchImpl = gl
           }
           return [name, observed];
         }));
+        // Record the options each question offered, not only the answer. A
+        // decision is only reviewable next to the choices it was made from: "查"
+        // means nothing without knowing that "不查" was the alternative.
+        const questionOptions = Object.freeze(Object.fromEntries(Object.entries(questions)
+          .map(([name, question]) => [name, Object.freeze(Object.keys(question.criteria || {}).slice(0, 16))])));
         const observation = () => Object.freeze({ protocol: 'systemone', model,
           questionNames: Object.freeze(Object.keys(questions)), answers: Object.freeze(observedAnswers),
-          durationMs: Math.max(0, performance.now() - startedAt) });
+          questionOptions, durationMs: Math.max(0, performance.now() - startedAt) });
         if (event.type === 'message' && recalls.length) {
-          if (choice('recall_gate', ['none', 'memory']) === 'none') return { actions: [], observation: observation() };
-          const mode = choice('retrieval_mode', ['recall', 'reflect']);
-          const operation = mode === 'reflect' ? 'deep' : 'search';
           const actions = [];
-          for (const scope of SCOPES) {
+          const wantsRecall = choice('recall_gate', ['none', 'memory']) === 'memory';
+          const mode = wantsRecall ? choice('retrieval_mode', ['recall', 'reflect']) : 'recall';
+          const operation = mode === 'reflect' ? 'deep' : 'search';
+          for (const scope of wantsRecall ? SCOPES : []) {
             const candidates = recalls.filter(candidate => candidate.scope === scope);
             if (!candidates.length || choice(`scope_${scope}`, ['skip', 'query']) === 'skip') continue;
-            const selected = candidates.find(candidate => candidate.operations.includes(operation));
-            if (selected) actions.push({ operation, backend: selected.backend, scope, query: event.text });
+            // Degrade instead of dropping. The model can pick `reflect` (deep
+            // synthesis) for a backend that only offers plain search — the real
+            // memos-bridge case. Requiring an exact match silently discarded the
+            // action, so the row said "memory needed, query this scope" while
+            // nothing was ever queried. A lighter read is still the read the
+            // model asked for in spirit.
+            const selected = candidates.find(candidate => candidate.operations.includes(operation))
+              ?? (operation === 'deep' ? candidates.find(candidate => candidate.operations.includes('search')) : undefined);
+            if (selected) actions.push({ operation: selected.operations.includes(operation) ? operation : 'search', backend: selected.backend, scope, query: event.text });
+          }
+          // A message can both need a lookup and carry something worth storing;
+          // deciding one must not suppress the other.
+          if (questions.retention_gate && choice('retention_gate', ['discard', 'retain']) === 'retain') {
+            for (const scope of SCOPES) {
+              const candidates = writes.filter(candidate => candidate.scope === scope);
+              if (!candidates.length || choice(`write_scope_${scope}`, ['skip', 'write']) === 'skip') continue;
+              actions.push({ ...candidates[0], content: event.text, evidence: { eventId: event.id, quote: event.text } });
+            }
           }
           return { actions, observation: observation() };
         }
@@ -301,30 +377,100 @@ export function createSystemOneDecision({ baseUrl, model, apiKey, fetchImpl = gl
  * Writes enqueue extraction; an accepted write is not a completed extraction.
  * Shapes verified against installed hindsight-coding-agents/dist/dsh.js client.
  */
+// A recall result must score at least this much to be worth the model's context.
+// Tuned against measured output from this bank, where genuine matches scored
+// ~1.0 and unrelated passages fell to ~0.0003; the gap is wide enough that a
+// floor here removes noise without discarding real hits. Results that carry no
+// score are kept: absence of a score is not evidence of irrelevance.
+const RECALL_RELEVANCE_FLOOR = 0.25;
+// Bound on a single reflect call before degrading to plain recall.
+const REFLECT_TIMEOUT_MS = 4_000;
+
 export function createHindsightBackend({ baseUrl, apiKey, bank, scope, scopeId, fetchImpl = globalThis.fetch }) {
   const fixed = binding(scope, scopeId);
   text(bank, 'bank');
   if (typeof fetchImpl !== 'function') throw new TypeError('fetchImpl is required');
   const url = `${endpoint(baseUrl)}/v1/default/banks/${encodeURIComponent(bank)}`;
+  const searchOnce = async (action, signal) => {
+    const result = await post(fetchImpl, `${url}/memories/recall`, apiKey, {
+      query: text(action.query, 'query'), types: ['observation'], budget: 'low', max_tokens: 2000, include: { entities: null },
+    }, signal);
+    if (!Array.isArray(result?.results)) throw new Error('Invalid Hindsight recall response');
+    // Keep only passages the store itself ranks as related. Measured on this
+    // bank: real hits scored ~1.09 final while clearly unrelated passages
+    // scored ~0.0003 — a 3000x drop — and the endpoint still returned twelve
+    // of them. Without a floor every one of those was concatenated into the
+    // model's context, so a "2 hits" record could hand the model ten
+    // irrelevant paragraphs.
+    const relevant = result.results.filter(item => {
+      const final = item?.scores?.final;
+      return typeof final !== 'number' || !Number.isFinite(final) || final >= RECALL_RELEVANCE_FLOOR;
+    });
+    const recalled = relevant.map(x => typeof x?.text === 'string' ? x.text.trim() : '').filter(Boolean).join('\n\n');
+    return { text: recalled, source: 'hindsight', metadata: {
+      hitCount: relevant.length, returnedChars: recalled.length,
+      ...(relevant.length !== result.results.length ? { droppedLowRelevance: result.results.length - relevant.length } : {}),
+    } };
+  };
+  // `reflect` has no latency contract and can run for minutes; a plain recall is
+  // bounded and usually enough. Try deep first, but never let it consume the
+  // caller's whole budget.
+  const deepWithFallback = async (action, signal) => {
+    const controller = new AbortController();
+    const forward = () => controller.abort();
+    signal?.addEventListener('abort', forward, { once: true });
+    const timer = setTimeout(() => controller.abort(), REFLECT_TIMEOUT_MS);
+    try {
+      const result = await post(fetchImpl, `${url}/reflect`, apiKey, { query: text(action.query, 'query'), budget: 'high' }, controller.signal);
+      if (typeof result?.text !== 'string') throw new Error('Invalid Hindsight reflect response');
+      const reflected = result.text.trim();
+      if (!reflected) throw new Error('Empty Hindsight reflect response');
+      return { text: reflected, source: 'hindsight', metadata: { hitCount: 1, returnedChars: reflected.length } };
+    } catch {
+      if (signal?.aborted) throw new Error('Aborted');
+      return searchOnce(action, signal);
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', forward);
+    }
+  };
   const capabilities = Object.freeze(['search', 'deep', 'write']);
   return Object.freeze({
     capabilities, ...fixed,
+    // Store a finished conversation turn as one document. Without this the
+    // repository bank only ever received writes that some explicit decision had
+    // already chosen — a project store could sit empty for weeks while the
+    // global MemOS bank accumulated thousands of turns, so every project-scoped
+    // recall came back with nothing useful.
+    async captureTurn(turn, { signal } = {}) {
+      const userText = text(turn?.userText, 'user text');
+      const assistantText = typeof turn?.assistantText === 'string' ? turn.assistantText.trim() : '';
+      if (!assistantText) return { skipped: 'no-assistant-text' };
+      const sessionId = text(turn?.session?.id, 'session id');
+      const turnNumber = Number.isSafeInteger(turn?.turn) ? turn.turn : 0;
+      const content = `[user] ${userText}\n[assistant] ${assistantText}`;
+      await post(fetchImpl, `${url}/memories`, apiKey, {
+        items: [{
+          content, context: userText.slice(0, 500), strategy: 'document',
+          tags: [`scope:${scope}`, `scope-id:${scopeId}`],
+          // Metadata values must be strings: the endpoint rejects a numeric turn
+          // with 422, and the transport hides the reason behind a generic error.
+          metadata: { session_id: sessionId, turn: String(turnNumber) },
+        }], async: true,
+      }, signal);
+      return { accepted: true };
+    },
     async execute(action, { signal, event } = {}) {
       checkAction(action, fixed, capabilities);
       checkAbort(signal);
-      if (action.operation === 'search') {
-        const result = await post(fetchImpl, `${url}/memories/recall`, apiKey, {
-          query: text(action.query, 'query'), types: ['observation'], budget: 'low', max_tokens: 2000, include: { entities: null },
-        }, signal);
-        if (!Array.isArray(result?.results)) throw new Error('Invalid Hindsight recall response');
-        const recalled = result.results.map(x => typeof x?.text === 'string' ? x.text.trim() : '').filter(Boolean).join('\n\n');
-        return { text: recalled, source: 'hindsight', metadata: { hitCount: result.results.length, returnedChars: recalled.length } };
-      }
+      if (action.operation === 'search') return searchOnce(action, signal);
       if (action.operation === 'deep') {
-        const result = await post(fetchImpl, `${url}/reflect`, apiKey, { query: text(action.query, 'query'), budget: 'high' }, signal);
-        if (typeof result?.text !== 'string') throw new Error('Invalid Hindsight reflect response');
-        const reflected = result.text.trim();
-        return { text: reflected, source: 'hindsight', metadata: { hitCount: reflected ? 1 : 0, returnedChars: reflected.length } };
+        // Reflect is a synchronous deep synthesis and measured slower than a
+        // whole retrieval budget, so a run that asked for it timed out with no
+        // context at all. Bound it, and degrade to plain search on expiry: a
+        // lighter read still answers the question the model asked.
+        const reflected = await deepWithFallback(action, signal);
+        return reflected;
       }
       const content = text(action.content, 'content');
       const evidence = action.evidence;

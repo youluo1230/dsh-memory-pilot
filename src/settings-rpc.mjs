@@ -14,10 +14,37 @@ function fail(code, message) {
   return { ok: false, error: { code, message } };
 }
 
+const clean = value => typeof value === 'string' ? value.trim() : '';
+
+function describeRow(settings, redacted) {
+  return settings.describe(redacted ? { redactSecrets: true } : {}).find(item => item.ns === SETTINGS_NAMESPACE);
+}
+
 function descriptor(settings) {
-  const row = settings.describe({ redactSecrets: true }).find(item => item.ns === SETTINGS_NAMESPACE);
+  const row = describeRow(settings, true);
   if (!row) return undefined;
-  return { ...row, writable: settings.writable === true };
+  // The platform deletes every `role('secret')` field before a settings view
+  // reaches a browser; `secrets` only reports whether a slot is filled. A
+  // password box therefore cannot show the stored value, and — worse — a draft
+  // built from this view has no key to send, so the connection probe fails on
+  // an endpoint that is actually configured. Read the unredacted row here and
+  // ship the secret values alongside the view so the panel can display them.
+  return { ...row, writable: settings.writable === true, secretValues: secretValues(settings) };
+}
+
+// Collect the current value of every secret slot the panel may edit. Only the
+// fields this plugin declares `role('secret')` are exposed; nothing else.
+function secretValues(settings) {
+  let row;
+  try { row = describeRow(settings, false); } catch { return {}; }
+  const value = row && row.value && typeof row.value === 'object' ? row.value : {};
+  const backends = Array.isArray(value.backends) ? value.backends : [];
+  return {
+    decisionApiKey: typeof value.decisionApiKey === 'string' ? value.decisionApiKey : '',
+    backends: Object.fromEntries(backends
+      .filter(backend => backend && typeof backend.id === 'string')
+      .map(backend => [backend.id, typeof backend.apiKey === 'string' ? backend.apiKey : ''])),
+  };
 }
 
 function validOps(ops) {
@@ -75,7 +102,20 @@ export function createSettingsRpcHandler(settings, { discover, createBank, testC
         || !payload.config || typeof payload.config !== 'object' || Array.isArray(payload.config)) {
         return fail('bad-request', 'Invalid MemoryPilot connection test request');
       }
-      try { return { ok: true, value: await safeTestConnection(payload, { signal }) }; }
+      // The probe runs against the DRAFT config, and a draft built from a
+      // redacted settings view carries no key at all. Sending that draft verbatim
+      // made an authorised endpoint answer 401 while the stored key worked, so
+      // the "test" button reported an error for a healthy configuration. Fall
+      // back to the persisted secret whenever the draft does not supply one;
+      // an explicitly typed key still wins, and an explicit empty string is
+      // treated as "not supplied" because a password box cannot mean "clear".
+      try {
+        const stored = secretValues(settings);
+        const config = { ...payload.config };
+        if (payload.kind === 'decision' && !clean(config.decisionApiKey)) config.decisionApiKey = stored.decisionApiKey;
+        if (payload.kind === 'system' && !clean(config.apiKey)) config.apiKey = stored.backends?.[config.id] ?? '';
+        return { ok: true, value: await safeTestConnection({ ...payload, config }, { signal }) };
+      }
       catch (error) {
         return fail('test-failed', error instanceof Error && error.message ? error.message : 'MemoryPilot connection test failed');
       }

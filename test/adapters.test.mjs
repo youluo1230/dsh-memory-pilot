@@ -99,7 +99,12 @@ test('SystemOne retrieval admission uses one hierarchical response and no-memory
   } });
   assert.deepEqual((await decision.decide(input)).actions, []);
   answers = { ...answers, recall_gate: { type: 'choice', choice: 'memory' } };
+  // The model asked for `reflect` (deep) in BOTH scopes, but the global backend
+  // only offers plain search. Degrade that scope to search instead of dropping
+  // it: an exact-capability requirement silently discarded the action, so the
+  // record said "query global memory" while nothing was ever queried there.
   assert.deepEqual((await decision.decide(input)).actions, [
+    { operation: 'search', backend: 'memos', scope: 'global', query: input.event.text },
     { operation: 'deep', backend: 'hindsight', scope: 'project', query: input.event.text },
   ]);
   assert.equal(requests, 2);
@@ -265,6 +270,110 @@ test('Hindsight recall/reflect use verified installed shapes, fixed URL and norm
   assert.equal(calls[0].signal, signal);
   assert.deepEqual(calls[0].body, { query: 'prior decision', types: ['observation'], budget: 'low', max_tokens: 2000, include: { entities: null } });
   assert.deepEqual(calls[1].body, { query: 'prior decision', budget: 'high' });
+});
+
+test('the decision adapter detects batch support and uses it', async () => {
+  // A proxy may expose only /systemone, so batch support has to be discovered
+  // rather than assumed. Probing must be cached, and a batch call must return one
+  // result per request in order.
+  const calls = [];
+  const decision = createSystemOneDecision({ baseUrl: 'https://example.invalid/v1', model: 'jev',
+    fetchImpl: async (url, init) => {
+      calls.push(url);
+      const body = JSON.parse(init.body);
+      if (url.endsWith('/systemone/batch')) return reply({ responses: body.requests.map(r => ({ answers: { g: { type: 'choice', choice: 'a' } } })) });
+      return reply({ answers: { g: { type: 'choice', choice: 'a' } } });
+    } });
+  assert.equal(await decision.supportsBatch(), true);
+  const questions = { g: { type: 'choice', instructions: 'pick', criteria: { a: 'A', b: 'B' } } };
+  const out = await decision.decideBatch([{ id: '1', state: { x: 1 }, questions }, { id: '2', state: { x: 2 }, questions }]);
+  assert.equal(out.length, 2);
+  // One probe plus one batch call; the probe result is cached.
+  assert.deepEqual(calls.map(u => u.replace('https://example.invalid/v1', '')), ['/systemone/batch', '/systemone/batch']);
+});
+
+test('an unsupported batch endpoint degrades to sequential calls', async () => {
+  let batchAttempts = 0, singles = 0;
+  const decision = createSystemOneDecision({ baseUrl: 'https://example.invalid/v1', model: 'jev',
+    fetchImpl: async url => {
+      if (url.endsWith('/systemone/batch')) { batchAttempts++; throw new Error('HTTP request rejected'); }
+      singles++;
+      return reply({ answers: { g: { type: 'choice', choice: 'a' } } });
+    } });
+  const questions = { g: { type: 'choice', instructions: 'pick', criteria: { a: 'A', b: 'B' } } };
+  const out = await decision.decideBatch([{ id: '1', state: {}, questions }, { id: '2', state: {}, questions }]);
+  assert.equal(out.length, 2, 'every request still gets an answer');
+  assert.equal(singles, 2, 'each request goes out on its own');
+  assert.equal(batchAttempts, 1, 'the probe is not repeated');
+});
+
+test('Hindsight degrades a slow reflect to plain recall instead of overrunning', async () => {
+  // Reflect is a synchronous deep synthesis that measured slower than an entire
+  // retrieval budget, so a run asking for it timed out having produced nothing.
+  // It must be bounded, and a bounded reflect must still return context.
+  const calls = [];
+  const backend = hindsight(async (url, init) => {
+    calls.push(url.endsWith('/reflect') ? 'reflect' : 'recall');
+    // Honour the abort signal: a mock that ignores it would hang forever, since
+    // the adapter can only take back control through that signal.
+    if (url.endsWith('/reflect')) return new Promise((_, reject) => {
+      init.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+    });
+    return reply({ results: [{ text: 'fallback hit', scores: { final: 1.0 } }] });
+  });
+  const result = await backend.execute(action('deep'), { signal: new AbortController().signal });
+  assert.deepEqual(calls, ['reflect', 'recall']);
+  assert.equal(result.text, 'fallback hit');
+  assert.equal(result.metadata.hitCount, 1);
+});
+
+test('an empty reflect response also falls back rather than returning nothing', async () => {
+  const backend = hindsight(async (url) => url.endsWith('/reflect')
+    ? reply({ text: '   ' })
+    : reply({ results: [{ text: 'fallback hit', scores: { final: 1.0 } }] }));
+  const result = await backend.execute(action('deep'), { signal: new AbortController().signal });
+  assert.equal(result.text, 'fallback hit');
+});
+
+test('Hindsight stores a finished turn so a repository bank can accumulate history', async () => {
+  // Without this the repository bank only received writes that an explicit
+  // decision had already chosen, so it stayed empty while the global bank grew.
+  let sent;
+  const backend = hindsight(async (_url, init) => { sent = JSON.parse(init.body); return reply({ items_count: 1 }); });
+  const result = await backend.captureTurn({ session: { id: 's1' }, turn: 4,
+    userText: 'how do I run the tests?', assistantText: 'Use npm test.' });
+  assert.deepEqual(result, { accepted: true });
+  assert.equal(sent.async, true);
+  assert.equal(sent.items[0].content, '[user] how do I run the tests?\n[assistant] Use npm test.');
+  // Metadata values must be strings; a numeric turn is rejected with 422 and the
+  // transport reports only a generic failure.
+  assert.deepEqual(sent.items[0].metadata, { session_id: 's1', turn: '4' });
+});
+
+test('Hindsight skips capture when the turn produced no assistant text', async () => {
+  let calls = 0;
+  const backend = hindsight(async () => { calls++; return reply({}); });
+  assert.deepEqual(await backend.captureTurn({ session: { id: 's1' }, turn: 1, userText: 'hi', assistantText: '   ' }),
+    { skipped: 'no-assistant-text' });
+  assert.equal(calls, 0, 'an empty answer must not spend a request');
+});
+
+test('Hindsight recall drops passages the store itself ranks as unrelated', async () => {
+  // Measured on this bank: genuine matches scored ~1.0 final, unrelated
+  // passages ~0.0003, and the endpoint returned twelve results regardless. Every
+  // one was concatenated into the model's context, so "2 hits" could mean two
+  // facts and ten irrelevant paragraphs.
+  const backend = hindsight(async () => reply({ results: [
+    { text: 'the real match', scores: { final: 1.09 } },
+    { text: 'also relevant', scores: { final: 0.82 } },
+    { text: 'pure noise one', scores: { final: 0.0003 } },
+    { text: 'pure noise two', scores: { final: 0.045 } },
+    { text: 'no score at all' },
+  ] }));
+  const result = await backend.execute(action(), { signal: new AbortController().signal });
+  assert.equal(result.text, 'the real match\n\nalso relevant\n\nno score at all');
+  assert.equal(result.metadata.hitCount, 3);
+  assert.equal(result.metadata.droppedLowRelevance, 2);
 });
 
 test('Hindsight write requires exact event evidence and only queues async retain', async () => {

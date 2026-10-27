@@ -24,11 +24,16 @@ test('the policy gate refuses a disabled plugin even with a global writable bind
   assert.equal(shouldCapture({ enabled: true, backends, disposed: true }), false);
 });
 
-test('the policy gate requires a global writable binding', async () => {
+test('the policy gate requires a writable binding, at any scope', async () => {
+  // Requiring `global` specifically kept a project repository permanently empty:
+  // its bank never received a single finished turn, so project-scoped recall
+  // always came back with nothing. A writable project store must admit capture.
   const { shouldCapture } = await import('../src/plugin.mjs');
   assert.equal(shouldCapture({ enabled: true, backends: [] }), false);
-  assert.equal(shouldCapture({ enabled: true, backends: [{ id: 'p', scope: 'project', write: true }] }), false);
+  assert.equal(shouldCapture({ enabled: true, backends: [{ id: 'p', scope: 'project', write: true }] }), true);
+  assert.equal(shouldCapture({ enabled: true, backends: [{ id: 'w', scope: 'workspace', write: true }] }), true);
   assert.equal(shouldCapture({ enabled: true, backends: [{ id: 'g', scope: 'global', write: false }] }), false);
+  assert.equal(shouldCapture({ enabled: true, backends: [{ id: 'r', scope: 'project', write: false }] }), false);
 });
 
 test('the wired gate also requires a buildable runtime, not just config', async () => {

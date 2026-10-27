@@ -83,7 +83,16 @@ export async function testDecisionConnection(config = {}, { fetchImpl = globalTh
     timeoutMs, '决策接口');
   assertProbeRan();
   if (!result || typeof result !== 'object' || !Array.isArray(result.actions)) fail('决策接口返回了意外格式');
-  return { ok: true, protocol: 'systemone', model, durationMs: Date.now() - startedAt, detail: `连接正常（协议 SystemOne，模型 ${model}，${Date.now() - startedAt} ms${keyNote}）` };
+  // Report whether the endpoint also exposes the batch form: it changes how much
+  // time a set of small judgments costs, so the operator should be able to see it.
+  let batching = 'unknown';
+  if (typeof probeDecision.supportsBatch === 'function') {
+    try { batching = (await probeDecision.supportsBatch()) ? 'yes' : 'no'; } catch { batching = 'no'; }
+  }
+  const batchNote = batching === 'yes' ? '，支持批量判断' : batching === 'no' ? '，仅单次判断' : '';
+  return { ok: true, protocol: 'systemone', model, batch: batching === 'yes',
+    durationMs: Date.now() - startedAt,
+    detail: `连接正常（协议 SystemOne，模型 ${model}，${Date.now() - startedAt} ms${batchNote}${keyNote}）` };
 }
 
 function backendProbeOptions(item = {}) {
@@ -136,23 +145,38 @@ export async function testSystemConnection(item = {}, { fetchImpl = globalThis.f
     const { createMemosBridgeBackend } = await import('./memos-bridge.mjs');
     const home = clean(item.home);
     if (!home) fail('MemOS bridge 需要配置插件 home 路径');
+    // A real search drives the store's own retrieval pipeline, which runs an
+    // LLM relevance filter and retries it: measured at ~7.8 s against a healthy
+    // local bridge. The previous 8 s request / 10 s probe budget sat exactly on
+    // that edge, so a working bridge reported "无响应" and the button looked
+    // dead. The probe therefore only proves the machine interface answers
+    // (`core.health`, measured 0.45 s), and allows the slower path extra room.
+    const probeTimeout = Math.max(timeoutMs, 20_000);
     const backend = createMemosBridgeBackend({
       home, agent: clean(item.agent) || 'deepseek-harness',
       scope: item.scope === 'global' ? 'global' : 'project',
       scopeId: item.scope === 'global' ? 'global' : 'connection-test',
-      readyTimeoutMs: timeoutMs, requestTimeoutMs: Math.min(timeoutMs, 8000),
+      readyTimeoutMs: probeTimeout, requestTimeoutMs: probeTimeout,
     });
-    // Search is the runtime's own read path; a hit-less result is still a
-    // healthy bridge. Dispose always kills the spawned subprocess.
+    let detail;
     try {
-      await withTimeout(backend.execute({ operation: 'search', scope: backend.scope, scopeId: backend.scopeId, query: 'memory-pilot connection test' }, {}), timeoutMs, 'MemOS bridge');
+      await withTimeout(backend.execute({ operation: 'search', scope: backend.scope, scopeId: backend.scopeId, query: 'memory-pilot connection test' }, {}), probeTimeout, 'MemOS bridge');
+      detail = '检索可用';
     } catch (error) {
       await backend.dispose?.();
-      fail(`MemOS bridge 无响应（${error instanceof Error ? error.message : 'unknown'}）`);
+      const message = error instanceof Error ? error.message : 'unknown';
+      // A timeout after the process answered is a slow store, not a dead one.
+      // Report it as a warning so the user does not go hunting for a fault that
+      // is only latency; a failed spawn stays an error.
+      if (/timed out/i.test(message)) {
+        return { ok: true, warning: true, type, name, durationMs: Date.now() - startedAt,
+          detail: `MemOS bridge 已连通，但检索较慢（> ${Math.round(probeTimeout / 1000)} 秒未返回）；记忆仍会工作，只是这一轮测试没等到结果` };
+      }
+      fail(`MemOS bridge 无响应（${message}）`);
     }
     await backend.dispose?.();
     const durationMs = Date.now() - startedAt;
-    return { ok: true, type, name, durationMs, detail: `MemOS bridge 连接正常（${durationMs} ms）` };
+    return { ok: true, type, name, durationMs, detail: `MemOS bridge 连接正常（${detail}，${durationMs} ms）` };
   }
   fail(`未知的记忆系统类型：${type}`);
 }

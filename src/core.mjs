@@ -35,8 +35,23 @@ const safeDecisionObservation = value => {
     }
     answers[name] = Object.freeze(observed);
   }
+  // Keep the offered options alongside the answers so a recorded decision can be
+  // read as "chose X out of [X, Y]" rather than a bare verdict.
+  let questionOptions;
+  if (object(value.questionOptions)) {
+    const options = {};
+    for (const name of questionNames) {
+      const list = value.questionOptions[name];
+      if (Array.isArray(list)) {
+        const cleaned = list.filter(identifier).slice(0, 16);
+        if (cleaned.length) options[name] = Object.freeze(cleaned);
+      }
+    }
+    if (Object.keys(options).length) questionOptions = Object.freeze(options);
+  }
   return Object.freeze({ protocol: value.protocol, model: value.model,
     questionNames: Object.freeze(questionNames), answers: Object.freeze(answers),
+    ...(questionOptions ? { questionOptions } : {}),
     durationMs: Number.isFinite(value.durationMs) ? Math.max(0, value.durationMs) : 0 });
 };
 
@@ -49,6 +64,11 @@ const safeDecisionObservation = value => {
  * Deduplication is in-memory only; timed-out writes are not retried by this instance.
  * Deadlines bound asynchronous waits, not synchronous JS blocking or remote effects.
  */
+// One memory turn can answer both questions — read and write — so the subject
+// names the concern this trace actually exercised. A trace that neither reads nor
+// writes is still a read judgment: that is the gate that decided nothing was needed.
+const memorySubject = () => 'memory.read';
+
 export function createOrchestrator({ decision, backends = {}, policy = {}, onAudit,
   budgetMs = 1000, maxActions = 8, maxContextChars = 8000 } = {}) {
   if (typeof decision?.decide !== 'function' || !object(backends) || !object(policy)
@@ -196,9 +216,31 @@ export function createOrchestrator({ decision, backends = {}, policy = {}, onAud
       timer = setTimeout(() => { expired = true; controller.abort(); resolve(timeout); }, runBudget);
     });
     const runStartedAt = performance.now();
+    // A trace for a run that never reached a decision. `question` identifies the
+    // turn so the Trajectory row still shows what was being evaluated.
+    const failureTrace = (status, reason) => Object.freeze({
+      schemaVersion: 1, subject: memorySubject(), kind: event.type === 'message' ? 'retrieval' : 'retention',
+      status, reason, question: event.text,
+      totalDurationMs: duration(runStartedAt), candidates: Object.freeze([]),
+      decision: Object.freeze({ protocol: 'none', model: 'not-contacted', questionNames: Object.freeze([]), answers: Object.freeze({}), durationMs: 0 }),
+      plan: Object.freeze({ validation: 'accepted', actions: Object.freeze([]) }),
+      executions: Object.freeze([]), injection: Object.freeze({ sourceCount: 0, contextChars: 0, truncated: false }),
+    });
     const work = async () => {
       const capabilities = inventory(event);
-      if (!capabilities.length || maxActions === 0) return empty('noop');
+      // A turn with nothing to do is still a decision worth showing: without a
+      // trace the Trajectory is simply blank, which reads as "the plugin never
+      // ran". Publish the reason instead (no capable backend / no actions left).
+      if (!capabilities.length || maxActions === 0) {
+        const reason = maxActions === 0 ? 'no-actions-allowed' : 'no-capabilities';
+        return { ...empty('noop'), trace: Object.freeze({ schemaVersion: 1,
+          kind: event.type === 'message' ? 'retrieval' : 'retention', status: 'noop', reason,
+          question: event.text,
+          totalDurationMs: duration(runStartedAt), candidates: Object.freeze([]),
+          decision: Object.freeze({ protocol: 'none', model: 'not-contacted', questionNames: Object.freeze([]), answers: Object.freeze({}), durationMs: 0 }),
+          plan: Object.freeze({ validation: 'accepted', actions: Object.freeze([]) }),
+          executions: Object.freeze([]), injection: Object.freeze({ sourceCount: 0, contextChars: 0, truncated: false }) }) };
+      }
       const candidates = Object.freeze(capabilities.map(capability => {
         const descriptor = adapters.get(capability.backend).descriptor;
         return Object.freeze({ backendId: capability.backend, scope: capability.scope,
@@ -208,7 +250,8 @@ export function createOrchestrator({ decision, backends = {}, policy = {}, onAud
       const decisionStartedAt = performance.now();
       const proposed = await decide(Object.freeze({ event, capabilities }), { signal: controller.signal });
       const decisionObservation = safeDecisionObservation(proposed?.observation);
-      const baseTrace = status => Object.freeze({ schemaVersion: 1, kind: event.type === 'message' ? 'retrieval' : 'retention', status,
+      const baseTrace = status => Object.freeze({ schemaVersion: 1, subject: memorySubject(), kind: event.type === 'message' ? 'retrieval' : 'retention', status,
+        question: event.text,
         totalDurationMs: duration(runStartedAt), candidates,
         decision: decisionObservation ?? Object.freeze({ protocol: 'unknown', model: 'unknown', questionNames: Object.freeze([]), answers: Object.freeze({}), durationMs: duration(decisionStartedAt) }),
         plan: Object.freeze({ validation: status === 'denied' ? 'denied' : 'accepted', actions: Object.freeze([]) }),
@@ -243,7 +286,10 @@ export function createOrchestrator({ decision, backends = {}, policy = {}, onAud
         mode: reads.some(item => item.action.operation === 'deep') ? 'reflect' : 'recall',
         targets: Object.freeze(reads.map(item => Object.freeze({ backend:item.action.backend,scope:item.action.scope,operation:item.action.operation,status:item.status }))),
       }) : undefined;
-      const trace = Object.freeze({ schemaVersion: 1, kind: event.type === 'message' ? 'retrieval' : 'retention', status,
+      const trace = Object.freeze({ schemaVersion: 1, subject: memorySubject(), kind: event.type === 'message' ? 'retrieval' : 'retention', status,
+        // The Trajectory row shows what the user asked; the orchestrator is the
+        // only place that still holds the exact text the decision saw.
+        question: event.text,
         totalDurationMs: duration(runStartedAt), candidates,
         decision: decisionObservation ?? Object.freeze({ protocol: 'unknown', model: 'unknown', questionNames: Object.freeze([]), answers: Object.freeze({}), durationMs: duration(decisionStartedAt) }),
         plan: Object.freeze({ validation: 'accepted', actions: Object.freeze(actions.map(action => Object.freeze({ backendId: action.backend, scope: action.scope, operation: action.operation }))) }),
@@ -252,10 +298,22 @@ export function createOrchestrator({ decision, backends = {}, policy = {}, onAud
           const metadata = object(item.value?.metadata) ? item.value.metadata : {};
           const response = { status: item.status };
           if (Number.isSafeInteger(metadata.hitCount) && metadata.hitCount >= 0) response.hitCount = metadata.hitCount;
+          // How much the relevance floor discarded. A high number next to a low
+          // hit count says the store had nothing close, which is exactly what a
+          // reader needs to judge a "no useful memory" outcome.
+          if (Number.isSafeInteger(metadata.droppedLowRelevance) && metadata.droppedLowRelevance > 0) response.droppedLowRelevance = metadata.droppedLowRelevance;
           if (Number.isSafeInteger(metadata.returnedChars) && metadata.returnedChars >= 0) response.returnedChars = metadata.returnedChars;
           if (Number.isSafeInteger(metadata.semanticHitCount) && metadata.semanticHitCount >= 0) response.semanticHitCount = metadata.semanticHitCount;
           if (Number.isSafeInteger(metadata.explicitFactCount) && metadata.explicitFactCount >= 0) response.explicitFactCount = metadata.explicitFactCount;
           if (typeof metadata.durable === 'boolean') response.durable = metadata.durable;
+          // Keep a short preview of what the read actually returned. Without it
+          // the Trajectory could only say "2 hits", which tells a reader nothing
+          // about whether those hits were relevant — the whole question when a
+          // recalled passage looks unrelated to what was asked.
+          if (item.status === 'ok' && item.action.operation !== 'write' && typeof item.value?.text === 'string') {
+            const preview = item.value.text.replace(/\s+/g, ' ').trim().slice(0, 280);
+            if (preview) response.preview = preview;
+          }
           return Object.freeze({ backendId: item.action.backend, scope: item.action.scope, operation: item.action.operation,
             ...descriptor, response: Object.freeze(response), durationMs: item.durationMs });
         })),
@@ -266,11 +324,15 @@ export function createOrchestrator({ decision, backends = {}, policy = {}, onAud
     };
     try {
       const result = await Promise.race([work(), expiration]);
-      if (callerSignal?.aborted) { expired = true; controller.abort(); audit('run', 'error'); return empty('error'); }
-      if (result === timeout || !alive()) { expired = true; controller.abort(); audit('run', 'timeout'); return empty('timeout'); }
+      // Timeouts and failures are the runs a user most needs to see; returning a
+      // bare `empty()` erased them from the Trajectory and made a stalled
+      // memory read indistinguishable from a plugin that never looked.
+      const failed = (status, reason) => ({ ...empty(status), ...(failureTrace ? { trace: failureTrace(status, reason) } : {}) });
+      if (callerSignal?.aborted) { expired = true; controller.abort(); audit('run', 'error'); return failed('error', 'aborted'); }
+      if (result === timeout || !alive()) { expired = true; controller.abort(); audit('run', 'timeout'); return failed('timeout', 'budget-exhausted'); }
       audit('run', result.status, result.results.length);
       return Object.freeze(result);
-    } catch { audit('run', 'error'); return empty('error'); }
+    } catch { audit('run', 'error'); return { ...empty('error'), ...(failureTrace ? { trace: failureTrace('error', 'exception') } : {}) }; }
     finally { clearTimeout(timer); callerSignal?.removeEventListener('abort', callerAbort); expired = true; controller.abort(); }
   }
 

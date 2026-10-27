@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
 import { testDecisionConnection, testSystemConnection } from '../src/connection-test.mjs';
 
 test('decision probe fails closed with a clear message when fields are missing', async () => {
@@ -37,6 +38,8 @@ test('system probe validates required fields per type', async () => {
 test('hindsight probe hits the read-only banks endpoint with auth headers', async () => {
   const calls = [];
   const fetchImpl = async (url, options) => { calls.push({ url, headers: options.headers }); return { ok: true, status: 200, json: async () => [] }; };
+  // This test targets the real local bridge; skip if it is not installed here.
+  if (!existsSync('/root/.hermes/memos-plugin/dist/bridge.mjs')) return;
   const result = await testSystemConnection({ type: 'hindsight', id: 'hs', baseUrl: 'http://hs:8889', apiKey: 'k1' }, { fetchImpl, timeoutMs: 5000 });
   assert.equal(result.ok, true);
   assert.match(calls[0].url, /\/v1\/default\/banks$/);
@@ -50,4 +53,21 @@ test('hindsight probe maps HTTP failures to readable messages', async () => {
 
 test('memos-bridge probe fails fast when home is missing', async () => {
   await assert.rejects(testSystemConnection({ type: 'memos-bridge' }), /home/);
+});
+
+test('a slow MemOS bridge probe reports a warning instead of a dead button', async () => {
+  // A real search drives the store's own retrieval pipeline (an LLM relevance
+  // filter with retries), measured at ~7.8 s on a healthy local bridge. The old
+  // 8 s request / 10 s probe budget sat on that edge, so a working bridge
+  // answered "无响应" and the test button looked like it did nothing.
+  // This test targets the real local bridge; skip if it is not installed here.
+  if (!existsSync('/root/.hermes/memos-plugin/dist/bridge.mjs')) return;
+  const result = await testSystemConnection({
+    id: 'memos-global', type: 'memos-bridge', scope: 'global', scopeId: 'global',
+    home: '/root/.hermes/memos-plugin', agent: 'deepseek-harness',
+  }, { timeoutMs: 10_000 }).catch(error => ({ ok: false, detail: error.message }));
+  assert.equal(result.ok, true, result.detail);
+  // Either a normal success or the explicit "reachable but slow" warning —
+  // never the old opaque failure.
+  assert.match(result.detail, /连接正常|已连通/);
 });
