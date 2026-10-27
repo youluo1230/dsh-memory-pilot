@@ -29,6 +29,21 @@ function resolveConfig(config) {
 }
 
 export const name = 'dsh-memory-pilot';
+
+// Whether a finished turn should be handed to a backend's `captureTurn`.
+//
+// This used to be `backends.some(b => b.scope === 'global' && b.write === true)`,
+// which describes configuration rather than what will happen. With the plugin
+// disabled — or with a profile whose only global-capable backend cannot capture
+// (Hindsight has no turn-capture endpoint) — the host still admitted every turn
+// and paid the full capture budget to reach a registry that did nothing.
+//
+// Exported so the gate can be tested without constructing a live backend.
+export function shouldCapture({ disposed = false, enabled = false, backends = [] } = {}) {
+  if (disposed || enabled !== true) return false;
+  return Array.isArray(backends) && backends.some(binding => binding?.scope === 'global' && binding.write === true);
+}
+
 export const inject = ['connection', 'webServer', 'settings', 'workspaceRegistry', 'tools', 'systemPrompt'];
 // Every editable field is volatile: the settings UI commits edits in place and
 // the Loader hands live references instead of remounting the plugin. The
@@ -133,6 +148,15 @@ export function apply(ctx, config) {
     return acceptsWorkspacePath(resolved.workspacePath, cwd)
       ? { id: resolved.workspaceId || resolved.workspacePath, path: resolved.workspacePath }
       : undefined;
+  };
+  // A runtime is keyed by project+workspace identity, so "can this profile build
+  // one" is answered against any admitted workspace. The capture predicate needs
+  // that answer without owning a session; an empty list means there is nothing
+  // to be enabled for yet.
+  const anyWorkspacePath = resolved => {
+    const listed = workspaceList();
+    if (Array.isArray(listed)) return listed[0]?.path;
+    return acceptsWorkspacePath(resolved.workspacePath, resolved.workspacePath ?? '') ? resolved.workspacePath : undefined;
   };
   const resolveProjectRef = reference => {
     if (typeof reference !== 'string') throw new Error('Unknown resident memory project');
@@ -322,7 +346,15 @@ export function apply(ctx, config) {
       const shaped = Number.isFinite(inner) && inner > 0 ? inner : 9000;
       return shaped + Math.max(15000, Math.round(shaped * 0.5));
     },
-    capture: () => (prepared().backends ?? []).some(binding => binding.scope === 'global' && binding.write === true),
+    capture: () => {
+      // Two layers: the exported policy gate (config-only, testable in isolation)
+      // and a runtime check, because a configured binding is not a usable one —
+      // `runtimeFor` returns null when the decision endpoint is missing.
+      const resolved = prepared();
+      if (!shouldCapture({ disposed, enabled: resolved.enabled, backends: resolved.backends })) return false;
+      const cwd = anyWorkspacePath(resolved);
+      return cwd !== undefined && runtimeFor({ header: { cwd } }) !== null;
+    },
     captureTurn: turn => runtimeFor(turn.session)?.registry?.captureTurn(turn),
     captureBudgetMs: () => current().captureBudgetMs ?? 60000,
     acceptsSession,
