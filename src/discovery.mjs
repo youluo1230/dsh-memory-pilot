@@ -2,6 +2,7 @@ import { readdir } from 'node:fs/promises';
 import { basename, relative, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import { bindingsForIdentity, normalizeConfiguration } from './configuration.mjs';
+import { resolveApiKey } from './secret.mjs';
 
 const SKIP_DIRECTORIES = new Set(['node_modules', '.git', 'build', 'dist', 'coverage', '.next', '.cache', 'out', 'target']);
 const clean = value => typeof value === 'string' ? value.trim() : '';
@@ -47,7 +48,7 @@ function hindsightEndpoint(system, suffix = '') {
   return endpoint;
 }
 function hindsightHeaders(system, env, json = false) {
-  const apiKey = clean(system.keyEnv) ? env[system.keyEnv] : clean(system.apiKey) || undefined;
+  const apiKey = resolveApiKey({ keyEnv: system.keyEnv, apiKey: system.apiKey }, env).value;
   return { ...(json ? { 'Content-Type': 'application/json' } : {}), ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) };
 }
 async function fetchBanks(system, { env, fetchImpl, signal }) {

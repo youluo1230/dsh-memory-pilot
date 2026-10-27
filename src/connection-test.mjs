@@ -11,6 +11,7 @@
 // bridge health).
 import { createOpenAICompatibleDecision, createSystemOneDecision, createHindsightBackend } from './adapters.mjs';
 import { createMemosHttpBackend } from './memos-http.mjs';
+import { resolveApiKey } from './secret.mjs';
 
 const fail = message => { throw new Error(message); };
 const clean = value => typeof value === 'string' ? value.trim() : '';
@@ -25,42 +26,70 @@ async function withTimeout(promise, timeoutMs, label) {
   } finally { clearTimeout(timer); }
 }
 
+// A probe MUST carry at least one capability. Both decide() implementations
+// build their questions from the capability list and return {actions:[]}
+// before issuing any request when it is empty — which made a dead endpoint
+// report "connection OK, 0 ms". These two records are shaped exactly like the
+// bindings the registry emits, so the probe drives the same code path the
+// runtime does (question construction, response validation, action mapping).
+const PROBE_CAPABILITIES = Object.freeze([
+  Object.freeze({ backend: 'probe-global', scope: 'global', operations: Object.freeze(['search', 'write']) }),
+  Object.freeze({ backend: 'probe-project', scope: 'project', operations: Object.freeze(['search']) }),
+]);
+const PROBE_EVENT = (type, text) => Object.freeze({
+  type, id: 'settings-test', sessionId: 'settings-test', text,
+  workspaceId: 'settings-test', workspacePath: '/settings-test',
+  projectId: 'settings-test', projectPath: '/settings-test',
+});
+
 export async function testDecisionConnection(config = {}, { fetchImpl = globalThis.fetch, env = process.env, timeoutMs = 10_000 } = {}) {
   const baseUrl = clean(config.decisionBaseUrl);
   const model = clean(config.decisionModel);
   if (!baseUrl) fail('未填写决策接口根地址');
   if (!model) fail('未填写模型名称');
-  const apiKey = clean(config.decisionKeyEnv) ? env[config.decisionKeyEnv] : (clean(config.apiKey) || undefined);
+  const key = resolveApiKey({ keyEnv: config.decisionKeyEnv, apiKey: config.decisionApiKey ?? config.apiKey }, env);
+  const apiKey = key.value;
   const createDecision = config.decisionProtocol === 'openai' ? createOpenAICompatibleDecision : createSystemOneDecision;
-  const decision = createDecision({ baseUrl, model, apiKey, fetchImpl, timeoutMs });
   const startedAt = Date.now();
+  // Count real round trips so the UI can never again report success for a call
+  // that never left the process.
+  let requests = 0;
+  const countedFetch = (url, options) => { requests += 1; return fetchImpl(url, options); };
+  const probeDecision = createDecision({ baseUrl, model, apiKey, fetchImpl: countedFetch, timeoutMs });
   // Adapters deliberately hide dependency errors; wrap so the UI shows what
-  // to fix (endpoint unreachable / malformed) instead of a bare adapter line.
-  const probe = (kind, event, capabilities) => decision.decide({ event, capabilities }, {}).catch(error => {
-    fail(`决策接口不可达或无响应（${kind}协议）：${error instanceof Error ? error.message : 'unknown'}`);
+  // to fix (endpoint unreachable / malformed / auth rejected) instead of a
+  // bare adapter line.
+  const probe = (kind, event, capabilities) => probeDecision.decide({ event, capabilities }, {}).catch(error => {
+    fail(`决策接口不可达或无响应（${kind}协议）：${error instanceof Error ? error.message : 'unknown'}${apiKey ? '' : '；未发送密钥'}`);
   });
-  // SystemOne answers typed questions; a minimal single-question state is the
-  // cheapest possible round trip that still exercises the real protocol.
+  // A probe is only meaningful if the protocol is really spoken end to end.
+  const assertProbeRan = () => {
+    if (requests === 0) fail('决策接口探测未发起网络请求（配置未生效）');
+  };
+  const keyNote = apiKey ? '' : '，未配置密钥';
   if (config.decisionProtocol === 'openai') {
-    // OpenAI-compatible probes go through decide() with an empty capability
-    // list; a healthy endpoint returns {"actions":[]}.
+    // A message event with recalls exercises question construction and the
+    // real /chat/completions round trip; a healthy endpoint returns actions.
     const result = await withTimeout(
-      probe('openai', { type: 'message', id: 'settings-test', sessionId: 'settings-test', text: 'connection test' }, []),
+      probe('openai', PROBE_EVENT('message', 'connection test'), PROBE_CAPABILITIES),
       timeoutMs, '决策接口');
+    assertProbeRan();
     if (!result || typeof result !== 'object' || !Array.isArray(result.actions)) fail('决策接口返回了意外格式');
-    return { ok: true, protocol: 'openai', model, durationMs: Date.now() - startedAt, detail: `连接正常（协议 openai，模型 ${model}，${Date.now() - startedAt} ms）` };
+    const durationMs = Date.now() - startedAt;
+    return { ok: true, protocol: 'openai', model, durationMs, detail: `连接正常（协议 openai，模型 ${model}，${durationMs} ms${keyNote}）` };
   }
   const result = await withTimeout(
-    probe('SystemOne', { type: 'checkpoint', id: 'settings-test', sessionId: 'settings-test', text: 'connection test' }, []),
+    probe('SystemOne', PROBE_EVENT('checkpoint', 'connection test'), PROBE_CAPABILITIES),
     timeoutMs, '决策接口');
+  assertProbeRan();
   if (!result || typeof result !== 'object' || !Array.isArray(result.actions)) fail('决策接口返回了意外格式');
-  return { ok: true, protocol: 'systemone', model, durationMs: Date.now() - startedAt, detail: `连接正常（协议 SystemOne，模型 ${model}，${Date.now() - startedAt} ms）` };
+  return { ok: true, protocol: 'systemone', model, durationMs: Date.now() - startedAt, detail: `连接正常（协议 SystemOne，模型 ${model}，${Date.now() - startedAt} ms${keyNote}）` };
 }
 
 function backendProbeOptions(item = {}) {
   return {
     baseUrl: clean(item.baseUrl),
-    apiKey: item.keyEnv ? process.env[item.keyEnv] : (clean(item.apiKey) || undefined),
+    apiKey: resolveApiKey({ keyEnv: item.keyEnv, apiKey: item.apiKey }).value,
     scope: item.scope || 'project',
     scopeId: item.scopeId || 'test',
   };

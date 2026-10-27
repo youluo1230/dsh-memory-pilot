@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { createHindsightBackend } from './adapters.mjs';
 import { createMemosHttpBackend } from './memos-http.mjs';
 import { createMemosBridgeBackend } from './memos-bridge.mjs';
+import { resolveApiKey } from './secret.mjs';
 
 // Registry factories are a seam for new backend APIs and test fakes.
 export function createRegistry({ bindings, identities, env = process.env, factories = {
@@ -16,7 +17,7 @@ export function createRegistry({ bindings, identities, env = process.env, factor
     if (!['personal','global','project','workspace'].includes(item.scope) || !scopeId || item.scopeId !== scopeId) throw new Error('Scope identity mismatch');
     if (!Object.hasOwn(factories, item.type)) throw new Error('Unknown backend type');
     if (item.type !== 'memos-bridge' && (typeof item.baseUrl !== 'string' || !item.baseUrl.trim())) throw new Error('Binding baseUrl required');
-    const apiKey = item.keyEnv ? env[item.keyEnv] : (item.apiKey || undefined);
+    const apiKey = resolveApiKey({ keyEnv: item.keyEnv, apiKey: item.apiKey }, env).value;
     const specific = item.type === 'memos'
       ? { sessionCookie: item.cookieEnv ? env[item.cookieEnv] : undefined, isolatedStore: item.isolatedStore === true }
       : item.type === 'memos-bridge'

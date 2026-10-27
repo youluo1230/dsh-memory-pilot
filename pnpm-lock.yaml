@@ -14,13 +14,13 @@ importers:
       '@deepseek-ai/schemastery':
         specifier: ^3.18.4
         version: 3.18.4
-      dsh-memory-pilot:
-        specifier: file:/vol1/1000/code/dsh-memory-pilot/dsh-memory-pilot-0.3.7.tgz
-        version: file:dsh-memory-pilot-0.3.7.tgz(@deepseek-ai/dsh-llm@0.2.0-rc.2(@deepseek-ai/cordis@4.0.4))(@deepseek-ai/dsh-tools@0.2.0-rc.2(c6e351a6a6cfd1c2a664558bffcd410d))(@deepseek-ai/schemastery@3.18.4)
     devDependencies:
       '@deepseek-ai/dsh-tools':
         specifier: 0.2.0-rc.2
         version: 0.2.0-rc.2(c6e351a6a6cfd1c2a664558bffcd410d)
+      zod:
+        specifier: ^3.25.76
+        version: 3.25.76
 
 packages:
 
@@ -174,14 +174,8 @@ packages:
   '@standard-schema/spec@1.1.0':
     resolution: {integrity: sha512-l2aFy5jALhniG5HgqrD6jXLi/rUWrKvqN/qJx6yoJsgKhblVd+iqqU4RCXavm/jPityDo5TCvKMnpjKnOriy0w==}
 
-  dsh-memory-pilot@file:dsh-memory-pilot-0.3.7.tgz:
-    resolution: {integrity: sha512-TlSA0Y9SkxEfdo7H1/e5yZwEylw40XA85l2p4FxxcsyM7VJgvCj2fqGDrqwb0CrDJLjoDRiLB1RaUrw+rprmEw==, tarball: file:dsh-memory-pilot-0.3.7.tgz}
-    version: 0.3.7
-    engines: {node: '>=22'}
-    peerDependencies:
-      '@deepseek-ai/dsh-llm': '>=0.2.0-rc.2 <0.3.0'
-      '@deepseek-ai/dsh-tools': '>=0.2.0-rc.2 <0.3.0'
-      '@deepseek-ai/schemastery': ^3.18.4
+  zod@3.25.76:
+    resolution: {integrity: sha512-gzUt/qt81nXsFGKIFcC3YnfEAx5NkunCfnDlvuBSSFS02bcXu4Lmea0AFIUwbLWxWPx3d9p8S5QoaujKcNQxcQ==}
 
   zod@4.6.5:
     resolution: {integrity: sha512-v5l/aFXZQeai4awLbOpSoHecE9UiMrnfx75tEXLjNonXVARxQ5mOeipTjROUchszUNCqnE+hqAMujRsRHsut2Q==}
@@ -331,10 +325,6 @@ snapshots:
 
   '@standard-schema/spec@1.1.0': {}
 
-  dsh-memory-pilot@file:dsh-memory-pilot-0.3.7.tgz(@deepseek-ai/dsh-llm@0.2.0-rc.2(@deepseek-ai/cordis@4.0.4))(@deepseek-ai/dsh-tools@0.2.0-rc.2(c6e351a6a6cfd1c2a664558bffcd410d))(@deepseek-ai/schemastery@3.18.4):
-    dependencies:
-      '@deepseek-ai/dsh-llm': 0.2.0-rc.2(@deepseek-ai/cordis@4.0.4)
-      '@deepseek-ai/dsh-tools': 0.2.0-rc.2(c6e351a6a6cfd1c2a664558bffcd410d)
-      '@deepseek-ai/schemastery': 3.18.4
+  zod@3.25.76: {}
 
   zod@4.6.5: {}

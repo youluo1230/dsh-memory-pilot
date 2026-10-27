@@ -53,6 +53,9 @@ test('plugin appends no event type outside the persistence read-path vocabulary'
     logger: { info: message => recorded.push(String(message)), warn: () => {} },
     on: (name, fn) => { hooks.set(name, fn); return () => hooks.delete(name); },
     tools: { register: () => () => {} },
+    // Optional-service injection: the decision trail registers through it. This
+    // test only proves no session event is appended, so the stub is inert.
+    inject: (_services, callback) => callback({ effect: body => { body(); return () => {}; }, sessionProjections: { register: () => () => {} } }),
   }, config);
   const realAppend = session.append.bind(session);
   session.append = (type, data) => { appended.push({ type }); return realAppend(type, data); };

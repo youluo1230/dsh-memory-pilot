@@ -25,5 +25,7 @@ test('loopback clients expose createBank through the same RPC channel', () => {
 });
 
 test('client declares connection runtime dependency', () => {
-  assert.match(source, /const inject = \["slots", "locale", "configForms", "connection", "uiConversation"\]/);
+  // `sessions` is required to read the decision-trail projection face that the
+  // Trajectory row renders; `connection` carries the settings RPC channel.
+  assert.match(source, /const inject = \["slots", "locale", "configForms", "connection", "uiConversation", "sessions"\]/);
 });

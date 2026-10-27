@@ -16,29 +16,47 @@ function loadClient() {
   return definition.factory((id) => id === 'react' ? fakeReact : { jsx() {} });
 }
 
-test('client projects model-hidden MemoryPilot observations into the trajectory target', () => {
+test('the trajectory row renders one decision trail entry with its questionnaire', () => {
   const client = loadClient();
-  const trace = {
-    schemaVersion: 1, kind: 'retrieval', status: 'ok', totalDurationMs: 1234,
-    candidates: [{ backendId: 'memos-global', engine: 'memos', adapter: 'memos-bridge', scope: 'global', operations: ['search'], store: { kind: 'shared-hub', display: 'MemOS shared store' } }],
-    decision: { protocol: 'systemone', model: 'clef-flash', durationMs: 250, questionNames: ['recall_gate'], answers: { recall_gate: { choice: 'memory' } } },
-    plan: { validation: 'accepted', actions: [{ backendId: 'memos-global', scope: 'global', operation: 'search' }] },
-    executions: [{ backendId: 'memos-global', engine: 'memos', adapter: 'memos-bridge', scope: 'global', operation: 'search', store: { kind: 'shared-hub', display: 'MemOS shared store' }, response: { status: 'ok', hitCount: 2 }, durationMs: 900 }],
-    injection: { sourceCount: 1, contextChars: 2048, truncated: false },
-  };
-  const node = client.memoryObservationNode({ type: 'plugin/observation', seq: 7, time: 1000, data: { plugin: 'dsh-memory-pilot', kind: 'retrieval', version: 1, turn: 1, summary: 'MemoryPilot ok', data: trace } });
-  assert.equal(node.kind, 'context');
-  assert.equal(node.seq, 7);
-  const detail = node.content[0].text;
-  assert.match(detail, /SystemOne \/ clef-flash/);
-  assert.match(detail, /global.*MemOS shared store/i);
-  assert.match(detail, /Selected scopes: global/);
-  assert.match(detail, /Skipped scopes: none/);
-  assert.match(detail, /2 hits/);
-  assert.match(detail, /2,048 chars/);
-  assert.match(detail, /Authorized candidates \(available for selection; not necessarily executed\)/);
-  assert.match(detail, /pre-request automatic memory only/);
-  assert.equal(detail.includes('memory result body'), false);
+  // The Trajectory row now reads the Host projection (src/trail.mjs) instead of a
+  // `plugin/observation` session event, because DSH's persistence path refuses
+  // unknown event types — the reason those rows silently disappeared (issue #1).
+  const text = client.trailText({
+    id: 's:3:1:retrieval', turn: 3, step: 1, question: '帮我看看记忆插件',
+    kind: 'retrieval', status: 'ok', totalDurationMs: 1234, protocol: 'systemone',
+    model: 'clef-flash', decisionDurationMs: 250,
+    questions: ['recall_gate', 'scope_global'],
+    answers: [{ name: 'recall_gate', choice: 'memory', confidence: 0.7 }, { name: 'scope_global', choice: 'query', confidence: 0.85 }],
+    actions: [{ backend: 'memos-global', scope: 'global', operation: 'search' }],
+    executions: [{ backend: 'memos-global', scope: 'global', operation: 'search', status: 'ok', hitCount: 2, durationMs: 900 }],
+    injectedChars: 2048,
+  });
+  // What the user asked, which is the whole point of the row.
+  assert.match(text, /问题：帮我看看记忆插件/);
+  // Which decision model ran and what it was asked, with the chosen levels.
+  assert.match(text, /systemone\/clef-flash/);
+  assert.match(text, /recall_gate → memory \(70%\)/);
+  assert.match(text, /scope_global → query \(85%\)/);
+  // What was authorized and what actually happened.
+  assert.match(text, /已授权动作/);
+  assert.match(text, /global · memos-global · search/);
+  assert.match(text, /2 命中/);
+  assert.match(text, /2,048 字符/);
+  assert.equal(client.TRAIL_KEY, 'memoryPilotTrail');
+});
+
+test('a noop decision explains itself instead of showing an empty action list', () => {
+  const client = loadClient();
+  const text = client.trailText({
+    id: 's:1:1:retrieval', turn: 1, step: 1, question: '你好', status: 'noop',
+    kind: 'retrieval', protocol: 'systemone', model: 'clef-flash',
+    totalDurationMs: 10, decisionDurationMs: 5, injectedChars: 0,
+    answers: [{ name: 'recall_gate', choice: 'none', confidence: 0.9 }],
+    actions: [], executions: [],
+  });
+  assert.match(text, /无需记忆/);
+  assert.match(text, /模型判定无需记忆操作/);
+  assert.match(text, /recall_gate → none/);
 });
 
 test('noop trajectory marks subordinate answers inactive instead of implying recall ran', () => {
@@ -152,9 +170,21 @@ test('memory system summary uses baseUrl and identifies an unmigrated legacy Mem
 test('system modal DOM contract exposes only service connection fields and two product types', () => {
   assert.match(source, /\[\["hindsight", "Hindsight"\], \["memos", "MemOS"\]\]/);
   assert.doesNotMatch(source, /\["memos-bridge", "MemOS Bridge"\]/);
-  for (const label of ['名称', '系统标识', '类型', '地址 (baseUrl)', '密钥环境变量', 'API Key（不建议明文）']) assert.match(source, new RegExp(label.replace(/[()]/g, '\\$&')));
-  for (const label of ['本地目录 (home)', 'Cookie 环境变量', '显示兼容设置']) assert.doesNotMatch(source, new RegExp(label.replace(/[()]/g, '\\$&')));
+  for (const label of ['名称', '系统标识', '类型', '地址 (baseUrl)', '密钥']) assert.match(source, new RegExp(label.replace(/[()]/g, '\\$&')));
+  // Credentials are one field: users should not have to know what an env var is.
+  for (const label of ['本地目录 (home)', 'Cookie 环境变量', '显示兼容设置', '密钥环境变量', 'API Key（不建议明文）']) assert.doesNotMatch(source, new RegExp(label.replace(/[()]/g, '\\$&')));
   assert.match(source, /连接服务实例，可访问该连接有权查看的全部记忆库/);
+});
+
+test('decision tab asks for one key and never mentions environment variables', () => {
+  const decision = source.slice(source.indexOf('if (active === "decision")'), source.indexOf('if (active === "systems")'));
+  assert.match(decision, /h\(Field, \{ label: "密钥"/);
+  assert.doesNotMatch(decision, /密钥环境变量/);
+  assert.doesNotMatch(decision, /环境变量优先/);
+  assert.doesNotMatch(decision, /MEMORY_DECISION_API_KEY/);
+  // The field still writes the literal key the runtime resolves.
+  assert.match(decision, /onChange: set\("decisionApiKey"\)/);
+  assert.match(decision, /type: "password"/);
 });
 
 test('ordinary UI never renders a scopeId field and supports automatic identity overrides', () => {
@@ -341,4 +371,53 @@ test('decision panel exposes the decision-model switch and reflects autonomous m
   assert.match(source, /自主判断/);
   // Field must be part of the scalar save list, or toggling it never persists.
   assert.match(source, /const SCALAR_FIELDS = \["enabled", "decisionEnabled"/);
+});
+
+test('the trajectory definition anchors a decision to its step and skips steps without one', () => {
+  const client = loadClient();
+  // Build the definition the way `apply` does, against a minimal fake of the
+  // services it touches: one Session carrying a trail projection.
+  let registered;
+  const entries = [{ id: 'e1', turn: 2, step: 1, question: '帮我查记忆', status: 'ok',
+    protocol: 'systemone', model: 'clef-flash', decisionDurationMs: 10, totalDurationMs: 20,
+    answers: [], actions: [], executions: [], injectedChars: 0 }];
+  const face = { getSnapshot: () => ({ entries }), subscribe: () => () => {} };
+  const ctx = {
+    locale: { bind: () => () => '', register: () => () => {} },
+    effect: body => { body(); return () => {}; },
+    slots: { inject: () => () => {}, register: () => () => {} },
+    configForms: { get: () => ({ getSnapshot: () => ({}), subscribe: () => () => {}, mutate: () => {} }), whileServed: () => () => {} },
+    connection: { isLoopback: false, rpc: { call: async () => ({ ok: true }) } },
+    uiConversation: { events: { register: definition => { registered = definition; return () => {}; } } },
+    sessions: {
+      list: { getSnapshot: () => ({ ids: ['s1'] }) },
+      binding: id => id === 's1' ? { session: { projections: { faceOf: () => face } } } : undefined,
+    },
+  };
+  client.apply(ctx);
+  assert.ok(registered, 'the trajectory definition must be registered');
+  assert.equal(registered.target, 'trajectory');
+
+  // A step that carries a decision yields a context cell carrying its text.
+  const match = registered.match({ type: 'step/start', seq: 42, time: 1000, data: { turn: 2, step: 1 } });
+  // Field-by-field: the definition lives in the vm realm, so deepEqual's
+  // prototype check would fail on otherwise identical plain objects.
+  assert.equal(match.id, 'mp:2:1');
+  assert.equal(match.role, 'update');
+  const state = registered.start({}, { event: { type: 'step/start', seq: 42, time: 1000, data: { turn: 2, step: 1 } }, location: { kind: 'unresolved' } });
+  const node = registered.buildViewNode({ key: 'k', kind: 'memory-pilot-decision', id: 'mp:2:1', state,
+    start: { location: { kind: 'unresolved' } } });
+  assert.equal(node.target, 'trajectory');
+  assert.equal(node.anchorSeq, 42);
+  assert.equal(node.data.kind, 'node');
+  assert.equal(node.data.node.kind, 'context');
+  assert.match(node.data.node.content[0].text, /帮我查记忆/);
+
+  // A step with no recorded decision produces no row, so ordinary steps stay clean.
+  const plain = registered.start({}, { event: { type: 'step/start', seq: 43, time: 1001, data: { turn: 9, step: 1 } }, location: { kind: 'unresolved' } });
+  assert.equal(registered.buildViewNode({ key: 'k2', kind: 'memory-pilot-decision', id: 'mp:9:1', state: plain,
+    start: { location: { kind: 'unresolved' } } }), null);
+
+  // Only step starts are anchors; a stray event must not claim the target.
+  assert.equal(registered.match({ type: 'assistant/message', seq: 44, data: {} }), null);
 });

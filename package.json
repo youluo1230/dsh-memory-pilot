@@ -1,6 +1,6 @@
 {
   "name": "dsh-memory-pilot",
-  "version": "0.3.14",
+  "version": "0.3.19",
   "private": false,
   "license": "MIT",
   "type": "module",
@@ -21,7 +21,8 @@
     "./resident-memory": "./src/resident-memory.mjs",
     "./retention-router": "./src/retention-router.mjs",
     "./client": "./lib/client.js",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./trail": "./src/trail.mjs"
   },
   "files": [
     "src",
@@ -34,7 +35,7 @@
   ],
   "scripts": {
     "test": "node --test",
-    "check": "node --check src/core.mjs && node --check src/adapters.mjs && node --check src/host.mjs && node --check src/plugin.mjs && node --check src/registry.mjs && node --check src/memos-http.mjs && node --check src/memos-bridge.mjs && node --check src/settings-rpc.mjs && node --check src/discovery.mjs && node --check src/configuration.mjs && node --check src/tools.mjs && node --check src/connection-test.mjs && node --check src/resident-targets.mjs && node --check src/resident-memory.mjs && node --check src/retention-router.mjs && node --check lib/client.js"
+    "check": "node --check src/core.mjs && node --check src/adapters.mjs && node --check src/host.mjs && node --check src/plugin.mjs && node --check src/registry.mjs && node --check src/memos-http.mjs && node --check src/memos-bridge.mjs && node --check src/settings-rpc.mjs && node --check src/discovery.mjs && node --check src/configuration.mjs && node --check src/tools.mjs && node --check src/connection-test.mjs && node --check src/secret.mjs && node --check src/trail.mjs && node --check src/resident-targets.mjs && node --check src/resident-memory.mjs && node --check src/retention-router.mjs && node --check lib/client.js"
   },
   "engines": {
     "node": ">=22"
@@ -42,7 +43,8 @@
   "peerDependencies": {
     "@deepseek-ai/dsh-llm": ">=0.2.0-rc.2 <0.3.0",
     "@deepseek-ai/dsh-tools": ">=0.2.0-rc.2 <0.3.0",
-    "@deepseek-ai/schemastery": "^3.18.4"
+    "@deepseek-ai/schemastery": "^3.18.4",
+    "zod": "^3.23.0 || ^4.0.0"
   },
   "dsh": {
     "bundle": {
@@ -61,6 +63,7 @@
     }
   },
   "devDependencies": {
-    "@deepseek-ai/dsh-tools": "0.2.0-rc.2"
+    "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
+    "zod": "^3.25.76"
   }
 }

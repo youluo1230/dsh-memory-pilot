@@ -11,6 +11,8 @@ import { testDecisionConnection, testSystemConnection } from './connection-test.
 import { registerMemoryTools } from './tools.mjs';
 import { createResidentMemory } from './resident-memory.mjs';
 import { createRetentionRouter } from './retention-router.mjs';
+import { resolveApiKey } from './secret.mjs';
+import { createDecisionTrail, toDecisionEntry } from './trail.mjs';
 
 const debug = line => { if (process.env.MEMORY_PILOT_DEBUG) console.error(`[memory-pilot] ${line}`); };
 debug('module evaluated');
@@ -48,6 +50,10 @@ export const Config = Schema.object({
   decisionModel: Schema.string().default('').volatile(),
   decisionProtocol: Schema.union(['systemone', 'openai']).default('systemone').volatile(),
   decisionKeyEnv: Schema.string().default('MEMORY_DECISION_API_KEY').volatile(),
+  // Literal key fallback. Many deployments cannot inject env vars into the DSH
+  // service, so the settings panel must be able to hold the key itself. When
+  // both are present the env var wins and this field is only a fallback.
+  decisionApiKey: Schema.string().default('').role('secret').volatile(),
   backends: Schema.array(Schema.object({
     id: Schema.string().required(), type: Schema.string().required(),
     baseUrl: Schema.string().default(''), bank: Schema.string().default(''),
@@ -73,12 +79,45 @@ export function apply(ctx, config) {
   const residentMemory = createResidentMemory();
   const residentSnapshots = new WeakMap();
   const residentLoads = new WeakMap();
+  // Decisions are published to the Trajectory through a session projection, not
+  // through a custom session event (see src/trail.mjs for why). The projection is
+  // optional: a profile without `sessionProjections` keeps working, it just shows
+  // nothing in the Trajectory.
+  const trail = createDecisionTrail();
+  // Set before any teardown. Async work started by an earlier turn (a capture
+  // resuming after turn/end, a pending snapshot, a tool still in flight) can
+  // run after this plugin's fiber was disposed. Cordis then throws
+  // `cannot get required service "..." in inactive context` for any injected
+  // service read on the old ctx; that exception escapes into the host and fails
+  // the whole turn. Every late path checks this flag and stands down instead.
+  let disposed = false;
   let configHash = '';
   const runtimes = new Map();
+  // Reading an injected service on a disposed fiber throws before optional
+  // chaining can help, so absence must be probed defensively.
+  const service = name => {
+    if (disposed) return undefined;
+    try { return ctx[name] ?? undefined; } catch { return undefined; }
+  };
+  // Audit and trace records are written from turn-time paths that can outlive
+  // the fiber, so logging is best-effort and never throws.
+  const log = (level, line) => {
+    if (disposed) return;
+    try { ctx.logger?.[level]?.(line); } catch { /* observability only */ }
+  };
+  const workspaceList = () => {
+    const registry = service('workspaceRegistry');
+    if (!registry || typeof registry.list !== 'function') return undefined;
+    try { return registry.list(); } catch { return undefined; }
+  };
   const disposeRuntimes = entries => void Promise.allSettled(entries.flatMap(runtime =>
     Object.values(runtime.registry?.backends ?? {}).map(backend => backend.dispose?.())));
   const prepared = () => {
     const resolved = current();
+    // After teardown the config is still readable, but runtimes are already
+    // disposed; skip the diff/recycle so late callers get a usable snapshot
+    // without resurrecting backends.
+    if (disposed) return resolved;
     const hash = JSON.stringify(resolved);
     if (hash !== configHash) {
       const previous = [...runtimes.values()];
@@ -89,9 +128,8 @@ export function apply(ctx, config) {
     return resolved;
   };
   const workspaceFor = (cwd, resolved = prepared()) => {
-    if (ctx.workspaceRegistry && typeof ctx.workspaceRegistry.list === 'function') {
-      return matchWorkspace(cwd, ctx.workspaceRegistry.list());
-    }
+    const listed = workspaceList();
+    if (Array.isArray(listed)) return matchWorkspace(cwd, listed);
     return acceptsWorkspacePath(resolved.workspacePath, cwd)
       ? { id: resolved.workspaceId || resolved.workspacePath, path: resolved.workspacePath }
       : undefined;
@@ -99,9 +137,10 @@ export function apply(ctx, config) {
   const resolveProjectRef = reference => {
     if (typeof reference !== 'string') throw new Error('Unknown resident memory project');
     const split = reference.indexOf('::');
-    if (split >= 0 && typeof ctx.workspaceRegistry?.list === 'function') {
+    const listed = split >= 0 ? workspaceList() : undefined;
+    if (Array.isArray(listed)) {
       const workspaceId = reference.slice(0, split), relativePath = reference.slice(split + 2);
-      const workspace = ctx.workspaceRegistry.list().find(row => String(row.id) === workspaceId);
+      const workspace = listed.find(row => String(row.id) === workspaceId);
       if (!workspace || relativePath.split(/[\\/]/).some(part => part === '..')) throw new Error('Unknown resident memory project');
       const candidate = resolve(workspace.path, relativePath);
       if (!acceptsWorkspacePath(workspace.path, candidate)) throw new Error('Unknown resident memory project');
@@ -113,6 +152,9 @@ export function apply(ctx, config) {
     return reference;
   };
   const identityFor = session => {
+    // Identity is derived from the workspace registry, so a disposed generation
+    // reports no identity instead of throwing.
+    if (disposed) return {};
     const resolved = prepared();
     const workspace = workspaceFor(session.header?.cwd, resolved);
     if (!workspace) return {};
@@ -123,6 +165,9 @@ export function apply(ctx, config) {
       .filter(([, value]) => Boolean(value)));
   };
   const runtimeFor = session => {
+    // Late work from a disposed generation must not rebuild runtimes or read
+    // services; the host treats `null` as "memory is off for this turn".
+    if (disposed) return null;
     const resolved = prepared();
     // `enabled` gates the plugin. The decision endpoint is only required when
     // the external decision model is switched on; in autonomous mode the agent
@@ -136,13 +181,13 @@ export function apply(ctx, config) {
     const bindings = bindingsForIdentity(resolved, identity);
     const registry = bindings.length ? createRegistry({ bindings, identities: { personal: identity.actorId, project: identity.projectId, workspace: identity.workspaceId } }) : null;
     const createDecision = resolved.decisionProtocol === 'openai' ? createOpenAICompatibleDecision : createSystemOneDecision;
-    const apiKey = resolved.decisionKeyEnv ? process.env[resolved.decisionKeyEnv] : undefined;
+    const apiKey = resolveApiKey({ keyEnv: resolved.decisionKeyEnv, apiKey: resolved.decisionApiKey }).value;
     const decision = usesDecision
       ? createDecision({ baseUrl: resolved.decisionBaseUrl, model: resolved.decisionModel, apiKey })
       : null;
     const orchestrator = registry && decision ? createOrchestrator({
       decision, backends: registry.backends, policy: registry.policy, budgetMs: resolved.budgetMs,
-      onAudit: record => ctx.logger.info(`MemoryPilot ${JSON.stringify(record)}`),
+      onAudit: record => log('info', `MemoryPilot ${JSON.stringify(record)}`),
     }) : null;
     const writable = Object.entries(registry?.backends ?? {}).filter(([,backend]) => backend.capabilities.includes('write'));
     const readable = Object.entries(registry?.backends ?? {}).filter(([,backend]) => backend.capabilities.includes('search'));
@@ -176,7 +221,7 @@ export function apply(ctx, config) {
     const retentionRouter = decision && typeof decision.decideRetention === 'function'
       ? createRetentionRouter({ decision, residentMemory, externalRetain,
         externalAvailable: () => writable.length === 1,
-        onAudit: record => ctx.logger.info(`MemoryPilot ${JSON.stringify(record)}`) }) : undefined;
+        onAudit: record => log('info', `MemoryPilot ${JSON.stringify(record)}`) }) : undefined;
     // Autonomous retention: an explicit memory_remember IS the decision, so the
     // content goes to every write-enabled backend. Fanning out is deliberate —
     // the agent asked for a durable record and has no basis to prefer one store,
@@ -195,15 +240,15 @@ export function apply(ctx, config) {
   const initial = prepared();
   if (initial.enabled && (initial.decisionEnabled === false
     || (initial.decisionBaseUrl && initial.decisionModel))) {
-    const firstPath = typeof ctx.workspaceRegistry?.list === 'function'
-      ? ctx.workspaceRegistry.list()[0]?.path : initial.workspacePath;
+    const listed = workspaceList();
+    const firstPath = Array.isArray(listed) ? listed[0]?.path : initial.workspacePath;
     if (firstPath) runtimeFor({ header: { cwd: firstPath } }); // preserve fail-fast configuration
   }
   const disposeSettingsRpc = installSettingsRpc(ctx, {
     getConfig: current,
     residentMemory,
     resolveIdentity: reference => identityFor({ header: { cwd: resolveProjectRef(reference) } }),
-    onAudit: record => ctx.logger.info(`MemoryPilot ${JSON.stringify(record)}`),
+    onAudit: record => log('info', `MemoryPilot ${JSON.stringify(record)}`),
     // One-shot probes for the settings UI "测试" buttons. They receive the
     // DRAFT (possibly unsaved) config and must not touch runtimes or state.
     testConnection: async ({ kind, config }, { signal } = {}) => {
@@ -212,6 +257,10 @@ export function apply(ctx, config) {
     },
   });
   const acceptsSession = session => {
+    // Reached from agent/pre-step on every user message, so a stale generation
+    // hits it immediately after a config reload. Standing down here is what
+    // stops the turn from failing with an inactive-context error.
+    if (disposed) return false;
     const resolved = prepared();
     if (resolved.enabled !== true || typeof session.header?.cwd !== 'string') return false;
     return Boolean(workspaceFor(session.header.cwd, resolved));
@@ -222,9 +271,14 @@ export function apply(ctx, config) {
     return { ...runtime, residentSnapshot: residentSnapshots.get(session) };
   };
   const snapshotFor = async session => {
+    if (disposed) return undefined;
     if (residentSnapshots.has(session)) return residentSnapshots.get(session);
     if (residentLoads.has(session)) return residentLoads.get(session);
-    const load = residentMemory.snapshot(identityFor(session)).then(snapshot => { residentSnapshots.set(session, snapshot); return snapshot; });
+    const load = residentMemory.snapshot(identityFor(session))
+      // A read that lands after teardown resolves to "no resident memory" rather
+      // than keeping a rejected promise in the shared load map.
+      .catch(error => { if (disposed) return undefined; throw error; })
+      .then(snapshot => { if (snapshot) residentSnapshots.set(session, snapshot); return snapshot; });
     residentLoads.set(session, load);
     try { return await load; } finally { residentLoads.delete(session); }
   };
@@ -246,12 +300,28 @@ export function apply(ctx, config) {
   const disposePersonaSession = ctx.on('session/disposed', session => {
     for (const [agent, off] of personaDisposers) if (agent.session === session) { off?.(); personaDisposers.delete(agent); }
   });
+  // Publish decisions to the Trajectory through the supported projection channel.
+  // Registration is an effect on this fiber, so unloading the plugin removes the
+  // key and Clients read it as capability absence instead of showing stale rows.
+  // The service is optional: without it the plugin works and the Trajectory simply
+  // shows no memory rows.
+  ctx.inject(['sessionProjections'], projectionCtx => {
+    projectionCtx.effect(() => projectionCtx.sessionProjections.register(trail.definition), 'dsh-memory-pilot: decision trail projection');
+  });
   const host = attachHost(ctx, {
     orchestratorFor: session => runtimeFor(session)?.orchestrator,
     residentSnapshotFor: snapshotFor,
-    // Deliberately floored at 60s: the interactive path spends its budget on the
-    // decision model plus one round of reads; a tighter value starves the reads.
-    retrievalBudgetMs: () => Math.max(current().budgetMs ?? 9000, 60000),
+    // The outer leash must be generous enough that the inner orchestrator deadline
+    // fires first and produces a shaped `timeout` result: an outer abort that wins
+    // the race leaves the caller with an opaque cancellation instead. The floor is
+    // therefore the configured budget plus headroom for the decision round-trip,
+    // NOT a constant — the previous hard 60 000 (with a 30 000 schema maximum)
+    // made the budget slider inert for every value a user could actually pick.
+    retrievalBudgetMs: () => {
+      const inner = Number(current().budgetMs);
+      const shaped = Number.isFinite(inner) && inner > 0 ? inner : 9000;
+      return shaped + Math.max(15000, Math.round(shaped * 0.5));
+    },
     capture: () => (prepared().backends ?? []).some(binding => binding.scope === 'global' && binding.write === true),
     captureTurn: turn => runtimeFor(turn.session)?.registry?.captureTurn(turn),
     captureBudgetMs: () => current().captureBudgetMs ?? 60000,
@@ -265,24 +335,48 @@ export function apply(ctx, config) {
     // the trajectory client keeps rendering legacy plugin/observation events.
     onResidentSnapshot: (session, snapshot, location = {}) => {
       const sources = Object.entries(snapshot.resident).filter(([,value])=>Boolean(value)).map(([scope,value])=>`${scope}:${value.length}`).join(',') || 'none';
-      ctx.logger.info(`MemoryPilot resident memory loaded turn=${location.turn ?? 0} sources=${sources} soul=${Boolean(snapshot.soul)}`);
+      log('info', `MemoryPilot resident memory loaded turn=${location.turn ?? 0} sources=${sources} soul=${Boolean(snapshot.soul)}`);
     },
     onTrace: (session, trace, location = {}) => {
       const scope = trace.executions?.[0]?.scope ?? 'none';
       const engine = trace.executions?.[0]?.engine ?? 'none';
       const operation = trace.executions?.[0]?.operation ?? 'none';
-      ctx.logger.info(`MemoryPilot ${trace.kind} ${trace.status}: ${scope} ${engine} ${operation} turn=${location.turn ?? 0}${location.step ? ` step=${location.step}` : ''}`);
+      log('info', `MemoryPilot ${trace.kind} ${trace.status}: ${scope} ${engine} ${operation} turn=${location.turn ?? 0}${location.step ? ` step=${location.step}` : ''}`);
+      // Hand the decision to the projection. It is folded into the Session's
+      // published trail by the first committed event of this step, so the
+      // Trajectory shows what the decision model was asked and chose.
+      if (!disposed) {
+        try {
+          trail.record({
+            sessionId: session?.id,
+            ...toDecisionEntry(trace, {
+              id: `${session?.id ?? 'session'}:${location.turn ?? 0}:${location.step ?? 0}:${trace.kind ?? 'decision'}`,
+              turn: location.turn,
+              step: location.step,
+              question: trace.question ?? '',
+            }),
+          });
+        } catch { /* observability must not alter execution */ }
+      }
     },
-    onError: code => ctx.logger.warn(`MemoryPilot ${code}`),
+    onError: code => log('warn', `MemoryPilot ${code}`),
   });
   ctx.on('dispose', async () => {
+    // Stand down first: in-flight captures and pending snapshots are awaited
+    // below, and they must see a disposed plugin before they touch any service.
+    disposed = true;
     disposeSettingsRpc?.();
     disposeTools?.();
     disposePersona?.();
     disposePersonaSession?.();
     for (const off of personaDisposers.values()) off?.();
     personaDisposers.clear();
+    const shuttingDown = [...runtimes.values()];
+    runtimes.clear();
+    trail.clear();
+    // residentLoads is a WeakMap and has no clear(); its entries fall away with
+    // the sessions that own them.
     await host.dispose();
-    await Promise.allSettled([...runtimes.values()].flatMap(runtime => Object.values(runtime.registry?.backends ?? {}).map(backend => backend.dispose?.())));
+    await Promise.allSettled(shuttingDown.flatMap(runtime => Object.values(runtime.registry?.backends ?? {}).map(backend => backend.dispose?.())));
   });
 }

@@ -1,11 +1,12 @@
 import { isResidentTarget, RESIDENT_TARGETS } from './resident-targets.mjs';
+import { safeReason } from './retention-router.mjs';
 
 export const SETTINGS_RPC_CHANNEL = '/dsh-memory-pilot-settings';
 export const SETTINGS_NAMESPACE = 'dsh-memory-pilot';
 
 const ALLOWED_FIELDS = new Set([
   'enabled', 'decisionEnabled', 'workspacePath', 'projectId', 'actorId', 'workspaceId',
-  'decisionBaseUrl', 'decisionModel', 'decisionProtocol', 'decisionKeyEnv', 'budgetMs',
+  'decisionBaseUrl', 'decisionModel', 'decisionProtocol', 'decisionKeyEnv', 'decisionApiKey', 'budgetMs',
   'captureBudgetMs', 'backends', 'scopeOverrides',
 ]);
 
@@ -93,10 +94,25 @@ export function createSettingsRpcHandler(settings, { discover, createBank, testC
         || (payload.projectPath !== undefined && typeof payload.projectPath !== 'string')) return fail('bad-request','Invalid resident memory mutation');
       try {
         const value=await residentMemory.apply({target:payload.target,content:payload.content,actor:'human'},payload.revision,{projectPath:payload.projectPath});
-        try { onAudit({kind:'resident-retention',actor:'human',target:payload.target,status:'ok',previousRevision:payload.revision,revision:value?.revision}); } catch {}
+        try { onAudit({kind:'resident-retention',actor:'human',target:payload.target,status:'ok',previousRevision:payload.revision,revision:value?.revision}); } catch { /* audit must never fail the write */ }
         return {ok:true,value};
       }
-      catch { try { onAudit({kind:'resident-retention',actor:'human',target:payload.target,status:'error'}); } catch {} return fail('resident-write-failed','Resident memory changed; reload and try again'); }
+      catch (failure) {
+        const reason = safeReason(failure);
+        try { onAudit({kind:'resident-retention',actor:'human',target:payload.target,status:'error',reason}); } catch { /* audit must never fail the write */ }
+        // A revision conflict is only one of several refusals. Telling the user to
+        // "reload and try again" when the real cause is an over-length document
+        // sends them round a loop that can never succeed: reloading cannot shrink
+        // the text. Each reason gets its own actionable message instead.
+        const message = {
+          'revision-conflict': 'Resident memory changed in another session; reload and try again.',
+          'exceeds-limit': `Resident memory is too long (limit ${RESIDENT_TARGETS[payload.target].maxLength} characters); shorten it before saving.`,
+          'human-managed': 'This document is human-managed only and cannot be written by the agent.',
+          'reserved-marker': 'Resident memory content contains a reserved marker comment.',
+          'missing-file': 'Resident memory file is missing.',
+        }[reason] ?? 'Resident memory could not be written; reload and try again';
+        return fail('resident-write-failed', message);
+      }
     }
     if (endpoint !== 'mutate') return fail('bad-request', 'Unknown MemoryPilot settings operation');
     if (!validOps(payload?.ops) || !Number.isSafeInteger(payload?.revision) || payload.revision < 0) {
@@ -112,19 +128,30 @@ export function createSettingsRpcHandler(settings, { discover, createBank, testC
   };
 }
 
+// Cordis owns this message. Match its stable shape (the quoted service name and
+// cordis's phrasing) rather than an unrelated substring; anything unrecognised
+// is rethrown unchanged instead of being silently swallowed.
+const WEB_SERVER_INJECT_ERROR = 'cannot get property "webServer" without inject';
 function missingWebServerInject(error) {
-  return error instanceof Error && /webServer/.test(error.message) && /without inject/.test(error.message);
+  return error instanceof Error && error.message === WEB_SERVER_INJECT_ERROR;
 }
 
 function registerChannel(ctx, handler) {
   try {
     return ctx.connection.rpc.handle(SETTINGS_RPC_CHANNEL, handler);
   } catch (error) {
-    if (!missingWebServerInject(error) || !ctx.webServer) throw error;
+    if (!missingWebServerInject(error)) throw error;
+    // `webServer` is in this plugin's inject list but its live getter is not
+    // resolvable here. Serve it from a local waterfall for the duration of the
+    // registration instead of failing; reading it again would throw the same
+    // error, so probe defensively.
+    let webServer;
+    try { webServer = ctx.webServer; } catch { webServer = undefined; }
+    if (!webServer) throw error;
     const listener = (_lookupCtx, prop, original, next) => {
       if (prop !== 'webServer') return next();
       try { return next(); } catch (failure) { if (failure !== original) throw failure; }
-      return ctx.webServer;
+      return webServer;
     };
     const off = ctx.on('internal/get', listener, { global: true });
     try {
@@ -137,12 +164,19 @@ function registerChannel(ctx, handler) {
 
 export function installSettingsRpc(ctx, { getConfig, discover, createBank, testConnection, residentMemory, resolveIdentity, onAudit } = {}) {
   if (!ctx?.connection?.rpc?.handle || !ctx?.settings) return () => {};
+  // Discovery runs on behalf of the settings panel and can resume while the
+  // plugin is being torn down, so the registry is probed defensively here too.
+  const listedWorkspaces = () => {
+    try {
+      const registry = ctx.workspaceRegistry;
+      if (!registry || typeof registry.list !== 'function') return undefined;
+      return registry.list().map(({ id, path, title }) => ({ id: String(id), path, title }));
+    } catch { return undefined; }
+  };
   const safeDiscover = typeof discover === 'function' ? discover : async ({ signal } = {}) => {
     if (typeof getConfig !== 'function') return { workspacePath: '', repositories: [], banks: [] };
     const { discoverScope } = await import('./discovery.mjs');
-    const workspaces = typeof ctx.workspaceRegistry?.list === 'function'
-      ? ctx.workspaceRegistry.list().map(({ id, path, title }) => ({ id: String(id), path, title }))
-      : undefined;
+    const workspaces = listedWorkspaces();
     return discoverScope(getConfig(), { signal, workspaces });
   };
   const safeCreateBank = typeof createBank === 'function' ? createBank : async (target, { signal } = {}) => {

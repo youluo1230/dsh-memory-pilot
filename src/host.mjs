@@ -47,7 +47,9 @@ export function attachHost(ctx, { orchestrator, orchestratorFor = () => orchestr
     const result = await safeRun(session, event, { budgetMs: typeof retrievalBudgetMs === 'function' ? retrievalBudgetMs() : retrievalBudgetMs });
     if (disposed || payload.signal?.aborted) return decision;
     if (result.trace) {
-      try { Promise.resolve(onTrace(session, result.trace, { turn: payload.turn, step: payload.step })).catch(() => {}); }
+      // The trace carries the decision but not the question it answered, so pass
+      // the trimmed text alongside it; the Trajectory row shows what was asked.
+      try { Promise.resolve(onTrace(session, result.trace, { turn: payload.turn, step: payload.step, question: userText })).catch(() => {}); }
       catch { /* Observability must not alter execution or model context. */ }
     }
     const additions = [resident?.context, result.context].filter(Boolean).map(createMessage);

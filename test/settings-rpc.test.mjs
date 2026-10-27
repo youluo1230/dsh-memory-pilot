@@ -180,3 +180,29 @@ test('remote settings RPC persists the decisionEnabled switch from the panel', a
   const on = await rpc('mutate', { revision: 2, ops: [{ op: 'set', path: ['decisionEnabled'], value: true }] });
   assert.equal(on.ok, true);
 });
+
+test('resident write refusals report the real cause instead of always claiming a revision conflict', async () => {
+  // A document over the length limit fails identically to a stale revision at the
+  // storage layer, but "reload and try again" sends the user round a loop that can
+  // never succeed: reloading cannot make the text shorter. Each refusal must name
+  // its own remedy.
+  const refuse = message => ({ inspect: async () => ({}), async apply() { throw new Error(message); } });
+  const cases = [
+    ['Resident memory content exceeds limit', /too long \(limit 8000 characters\)/],
+    ['Resident memory revision conflict', /changed in another session/],
+    ['SOUL.md is human-managed only', /human-managed only/],
+    ['Resident memory content contains a reserved marker', /reserved marker/],
+    ['Unexpected disk explosion', /reload and try again/],
+  ];
+  for (const [thrown, expected] of cases) {
+    const rpc = createSettingsRpcHandler({ writable: true, describe: () => [descriptor()] }, { residentMemory: refuse(thrown) });
+    const result = await rpc('resident-put', { target: 'global-memory', content: 'x', revision: 'r1' });
+    assert.equal(result.ok, false);
+    assert.equal(result.error.code, 'resident-write-failed');
+    assert.match(result.error.message, expected, `"${thrown}" must surface its own remedy`);
+  }
+  // The length in the message tracks the target's real limit.
+  const soulRefusal = createSettingsRpcHandler({ writable: true, describe: () => [descriptor()] }, { residentMemory: refuse('Resident memory content exceeds limit') });
+  const soul = await soulRefusal('resident-put', { target: 'soul', content: 'x', revision: 'r1' });
+  assert.match(soul.error.message, /limit 12000 characters/);
+});
