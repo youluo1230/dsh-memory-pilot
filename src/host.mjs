@@ -67,7 +67,35 @@ export function captureTrace(settled, { turn = 0, durationMs = 0, question = '',
   };
 }
 
-export function attachHost(ctx, { orchestrator, orchestratorFor = () => orchestrator, createMessage, identity, residentSnapshotFor, acceptsSession = () => true, retrievalBudgetMs = 60000, capture = false, captureTurn, captureBudgetMs = 60000, maxTextChars = 12000, onResidentSnapshot = () => {}, onTrace = () => {}, onError = () => {}, safety = () => undefined }) {
+// A trace for the distillation attempt, so the decision log can show that a turn
+// was considered and what it selected. Without it a distillation that chose nothing
+// is indistinguishable from one that never ran — which is the same silence the
+// capture trace was added to break.
+export function distillTrace(report, { turn = 0, question = '' } = {}) {
+  const retained = Array.isArray(report?.retained) ? report.retained : [];
+  const failed = Array.isArray(report?.failed) ? report.failed : [];
+  const gate = report?.gate === 'keep';
+  return {
+    schemaVersion: 1, kind: 'distillation',
+    status: failed.length && !retained.length ? 'error' : retained.length ? 'ok' : 'noop',
+    subject: 'session.distill', marker: 'distill', question,
+    totalDurationMs: Number.isFinite(report?.durationMs) ? Math.round(report.durationMs) : 0,
+    candidates: Array.isArray(report?.candidateTexts) ? report.candidateTexts.slice(0, 8) : [],
+    // The coarse gate's answer is the readable part of this record: it explains why
+    // a turn produced nothing, which is the question a user actually asks.
+    decision: { protocol: 'systemone', model: 'narrow-judge', questionNames: gate ? ['turn_worth_keeping', 'candidate_selection'] : ['turn_worth_keeping'],
+      answers: { turn_worth_keeping: { choice: gate ? 'keep' : 'discard' } },
+      durationMs: Number.isFinite(report?.durationMs) ? Math.round(report.durationMs) : 0 },
+    plan: { validation: 'accepted', actions: retained.map(row => ({ backendId: String(row.target ?? 'none'), scope: String(row.target ?? 'none'), operation: 'write' })) },
+    executions: retained.map(row => ({ backendId: String(row.target ?? 'none'), scope: String(row.target ?? 'none'), operation: 'write',
+      response: { status: row.degraded ? 'degraded' : 'ok' }, durationMs: 0 })),
+    injection: { sourceCount: 0, contextChars: 0, truncated: false },
+    distill: { candidates: Array.isArray(report?.candidateTexts) ? report.candidateTexts.length : (report?.candidates ?? 0),
+      retained: retained.length, failed: failed.length, ...(report?.reason ? { reason: report.reason } : {}) },
+  };
+}
+
+export function attachHost(ctx, { orchestrator, orchestratorFor = () => orchestrator, createMessage, identity, residentSnapshotFor, acceptsSession = () => true, retrievalBudgetMs = 60000, capture = false, captureTurn, captureBudgetMs = 60000, maxTextChars = 12000, onResidentSnapshot = () => {}, onTrace = () => {}, onError = () => {}, distill = () => undefined, capturesTurn = () => true }) {
   // capture/captureBudgetMs may be callables so a plugin backed by live
   // (volatile) config can re-evaluate them per event without remounting.
   const captureOn = typeof capture === 'function' ? capture : () => capture === true;
@@ -111,8 +139,7 @@ export function attachHost(ctx, { orchestrator, orchestratorFor = () => orchestr
     const visible = decision.messages.filter(message => ['user','assistant'].includes(message.source?.kind))
       .map(message => `${message.source.kind}: ${text(message.content)}`.slice(0,2000)).filter(line => !line.endsWith(': ')).slice(-12);
     const event = { ...describe(session, payload.turn, 'message', userText), availableContext: visible,
-      ...(resident?.resident ? { residentMemory: resident.resident } : {}) };
-    const result = await safeRun(session, event, { budgetMs: typeof retrievalBudgetMs === 'function' ? retrievalBudgetMs() : retrievalBudgetMs });
+      ...(resident?.resident ? { residentMemory: resident.resident } : {}) };    const result = await safeRun(session, event, { budgetMs: typeof retrievalBudgetMs === 'function' ? retrievalBudgetMs() : retrievalBudgetMs });
     if (disposed || payload.signal?.aborted) return decision;
     if (result.trace) {
       // The trace carries the decision but not the question it answered, so pass
@@ -131,27 +158,12 @@ export function attachHost(ctx, { orchestrator, orchestratorFor = () => orchestr
       resident?.context ? createMessage(resident.context, { label: '常驻记忆（USER / MEMORY）', count: Object.values(resident.resident ?? {}).filter(Boolean).length, truncated: false }) : undefined,
       result.context ? createMessage(result.context, { label: `MemoryPilot 召回（${recalled.length} 个库，${hits} 条）`, count: hits, truncated: result.trace?.injection?.truncated === true, decision: decisionForLog(result.trace, { turn: payload.turn, step: payload.step, question: userText }) }) : undefined,
     ].filter(Boolean);
-    // A judgment can be worth making whether or not memory was involved: the
-    // command-safety point always runs, and its verdict may be appended as a note
-    // so the model sees the caution where it acts. It must not be gated behind a
-    // memory hit, or a turn needing no recall would silently skip it.
-    let cautionMessages = [];
-    try {
-      // `session`, never `payload.agent`: the Agent wraps the Session but is not
-      // one. Every consumer of this hook reads `session.header.cwd`, so passing the
-      // Agent made the very first read throw, and the throw surfaced as an opaque
-      // turn error ("Cannot read properties of undefined (reading 'turn')").
-      const judged = await safety(session, { text: userText, turn: payload.turn, step: payload.step, decide: decisionForLog });
-      if (disposed || payload.signal?.aborted) return decision;
-      if (judged) {
-        if (judged.trace) {
-          try { Promise.resolve(onTrace(session, judged.trace, { turn: payload.turn, step: payload.step, question: userText })).catch(() => {}); }
-          catch { /* Observability must not alter execution. */ }
-        }
-        if (judged.caution) cautionMessages = [createMessage(judged.caution, { label: judged.label ?? '决策提示', count: 1, truncated: false, ...(judged.record ? { decision: judged.record } : {}) })];
-      }
-    } catch { onError('safety_decision_failed'); }
-    const all = [...additions, ...cautionMessages];
+    // Tool safety used to run here as a caution note. It moved to
+    // `tools/pre-execute`, where it can actually veto a call, so the host no longer
+    // carries a note-only judgment. What it does carry now is the field memory.read
+    // declares and previously never received: a digest of resident memory, so the
+    // recall criterion can stop guessing about what is already in front of the user.
+    const all = additions;
     if (!all.length) return decision;
     return { ...decision, messages: [...decision.messages, ...all] };
   };
@@ -193,10 +205,29 @@ export function attachHost(ctx, { orchestrator, orchestratorFor = () => orchestr
     }
     if (event.type === 'turn/end') {
       turns.delete(id);
-      if (!captureOn() || event.data?.reason === 'error' || event.data?.reason === 'aborted') return;
+      const reason = event.data?.reason;
+      // A TurnEndReason is a tagged object, not a string; comparing it directly to
+      // 'error' made every turn look successful.
+      const kind = typeof reason === 'string' ? reason : reason?.kind;
+      // Distillation is not capture. Capture stores the conversation stream;
+      // distillation asks the decision layer which of it is worth keeping. They run
+      // as separate tasks so a failure in one never suppresses the other.
+      if (kind !== 'error' && kind !== 'aborted' && capturesTurn()) {
+        const task = (async () => distill({
+          session, turn, userText: state.userText, assistantText: state.assistantText, reason,
+        }))();
+        pending.add(task);
+        void task.then(report => {
+          if (!report) return;
+          try {
+            Promise.resolve(onTrace(session, distillTrace(report, { turn, question: state.userText }), { turn, step: 0, question: state.userText })).catch(() => {});
+          } catch { /* observability must not alter execution */ }
+        }).catch(() => {}).finally(() => pending.delete(task));
+      }
+      if (!captureOn() || kind === 'error' || kind === 'aborted') return;
       const captureStartedAt = performance.now();
       const task = typeof captureTurn === 'function'
-        ? Promise.resolve(captureTurn({ session, turn, userText: state.userText, assistantText: state.assistantText, reason: event.data?.reason }, { budgetMs: captureBudget() }))
+        ? Promise.resolve(captureTurn({ session, turn, userText: state.userText, assistantText: state.assistantText, reason }, { budgetMs: captureBudget() }))
         : safeRun(session, describe(session, turn, 'turn_end', JSON.stringify({ user: state.userText, assistant: state.assistantText, evidenceStatus: 'conversation-only, not independently verified' })), { budgetMs: captureBudget() });
       pending.add(task);
       // Capture is silent by design — it runs after the answer — but silence is

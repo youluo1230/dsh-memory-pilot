@@ -48,6 +48,18 @@ The set of closed-choice questions a decision point puts to the judgment model, 
 
 The concern a decision point judges, named as `domain.concern` (for example `memory.read`, `command.safety`). A subject is what the record and the viewer classify by.
 
+## Declaration source
+
+The single declaration of a decision point that the runtime reads when it builds a questionnaire and interprets the answers. A declaration is not authoritative merely by existing: a point whose declaration the runtime never loads is documentation, not behaviour.
+
+## Non-memory decision point
+
+A decision point whose judgment subject is not memory — for example whether a pending tool call is safe to run. Its existence is the evidence that the decision layer is general rather than memory-shaped.
+
+## Landing
+
+The effect a declaration's authorized verb produces, supplied per trigger by the caller that owns the real work (a memory query, a resident write, an approval prompt). A landing is the seam between a declaration and an effect: the decision layer reads the declaration and knows only that an answer authorized a verb, while the landing knows what that verb means. Adding a decision point means adding a declaration and naming a landing, never editing the layer — which is what makes the extension claim testable.
+
 ## Automation tier
 
 How a decision point's answer is acted on, ordered from most to least autonomous: silent execution, silent execution with after-the-fact visibility, and asking the user. An author sets the default; a user may tighten it but not loosen it, because loosening admits misjudgments the author did not design for.
@@ -87,6 +99,22 @@ Cross-project resident memory about the user's stable identity, preferences, com
 ## Resident fact
 
 A concise fact that must remain visible without retrieval. A resident fact may be global or repository-scoped. Detailed history and experience belong in an external memory system.
+
+## Session distillation
+
+The selection, at an end-of-session signal, of the durable content a finished conversation produced, and its retention into resident memory or an external backend. Distillation is a model-driven selection over candidate content; it is distinct from Turn capture, which stores the conversation stream without selecting anything, and from a Resident fact, which is a product of distillation rather than the act itself.
+
+## Distillation candidate
+
+A bounded piece of a finished conversation presented to the judgment model for a retain-or-discard selection. Candidates are cut by the plugin, never invented by the judgment model, and each is judged on its own rather than as part of a long transcript.
+
+## End of session
+
+A signal that a conversation will not continue. Archiving a session is the strongest such signal available to the plugin. A turn-count threshold is a weaker substitute for a conversation that is never archived. Release of an in-memory session is not an end-of-session signal, because an archived session may stay resident.
+
+## Severity
+
+The ordered assessment a tool-safety judgment makes of a pending tool call: reversible, destructive, unknown, or out of scope. Severity states what the call would cost if it were wrong; it does not by itself decide whether the user is asked, because the automation tier decides that.
 
 ## Managed memory entry
 

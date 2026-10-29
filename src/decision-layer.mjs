@@ -55,6 +55,30 @@ export function decisionRecord({ subject, mode = 'single', questions = {}, answe
   });
 }
 
+/** The names a declaration says must resolve before it may be asked. */
+export function declaredDependencies(point) {
+  const depends = point?.depends;
+  if (depends === undefined) return [];
+  if (!Array.isArray(depends)) throw new Error(`depends of ${point?.name} must be an array`);
+  return depends;
+}
+
+/** The state fields a runtime actually supplies to its points.
+ *
+ * A declaration naming a field the runtime never provides is the failure mode this
+ * check exists for: the point still gets answered, so nothing looks broken, but its
+ * criteria were written to read a field that is always absent. The memory-read
+ * declaration named `residentDigest` for months while the host never supplied it.
+ */
+export const RUNTIME_STATE_FIELDS = Object.freeze(['message', 'candidates', 'environment', 'residentDigest', 'context', 'transcript']);
+
+/** Fields a declaration may name that the runtime genuinely provides. */
+export function unprovidedStateFields(point, provided = RUNTIME_STATE_FIELDS) {
+  const declared = point?.stateFields;
+  if (!Array.isArray(declared) || !declared.length) return [];
+  return declared.filter(field => !provided.includes(field));
+}
+
 /**
  * Order judgments so dependencies run before their dependents, and group
  * independent ones at the same depth so they can share one request.
@@ -71,7 +95,11 @@ export function planStages(subjects) {
     if (depth.has(subject.name)) return depth.get(subject.name);
     if (seen.has(subject.name)) throw new Error(`Dependency cycle at ${subject.name}`);
     seen.add(subject.name);
-    const parents = (subject.after ?? []).map(name => {
+    // `depends` is the field a declaration writes, and this function used to read
+    // `after` — which no declaration ever set. The dependency ordering was
+    // therefore inert: every point planned into stage 0 and the declared order was
+    // decoration. Read the field the declaration actually uses.
+    const parents = declaredDependencies(subject).map(name => {
       const parent = byName.get(name);
       if (parent === undefined) throw new Error(`Unknown dependency ${name}`);
       return visit(parent, seen);
@@ -157,6 +185,24 @@ export function resolveAutomationTier({ authorTier, userTier } = {}) {
 export const ACTION_KINDS = Object.freeze(['proceed', 'skip', 'ask', 'inject', 'store', 'route']);
 
 /**
+ * Ordered tool-safety severities, least to most costly if wrong.
+ *
+ * The judgment reports severity; it does not decide whether the user is asked.
+ * Collapsing the two made the model's uncertainty and the user's policy
+ * indistinguishable, so a user could not say "record it but stop interrupting me".
+ */
+export const SEVERITIES = Object.freeze(['reversible', 'destructive', 'unknown', 'out-of-scope']);
+
+/** Severities that warrant asking by default: the cost of being wrong is a
+ * visible change, not a re-run. */
+export const ASK_SEVERITIES = Object.freeze(['destructive', 'out-of-scope']);
+
+/** Map a severity to an ordinal, or -1 when unknown. */
+export function severityRank(severity) {
+  return SEVERITIES.indexOf(severity);
+}
+
+/**
  * Validate a declarative decision point before it is allowed to run.
  *
  * A misconfigured point fails quietly in the worst way: the questionnaire still
@@ -169,6 +215,10 @@ export function validateDecisionPoint(point) {
   if (typeof point.name !== 'string' || !point.name.trim()) errors.push('name is required');
   if (typeof point.trigger !== 'string' || !point.trigger.trim()) errors.push('trigger is required');
   if (!AUTOMATION_TIERS.includes(point.automation)) errors.push(`automation must be one of ${AUTOMATION_TIERS.join(', ')}`);
+  // A declared field the runtime never supplies is a judgment made blind. Name it
+  // at load time, where a user can fix it, instead of letting it answer on nothing.
+  for (const field of unprovidedStateFields(point)) errors.push(`state field ${field} is never provided at runtime`);
+  if (point.depends !== undefined && !Array.isArray(point.depends)) errors.push('depends must be an array');
   const questions = point.questions;
   if (!questions || typeof questions !== 'object' || !Object.keys(questions).length) {
     errors.push('at least one question is required');

@@ -1,5 +1,6 @@
 import { isResidentTarget, RESIDENT_TARGETS } from './resident-targets.mjs';
 import { safeReason } from './retention-router.mjs';
+import { summarizeActivity } from './activity.mjs';
 
 export const SETTINGS_RPC_CHANNEL = '/dsh-memory-pilot-settings';
 export const SETTINGS_NAMESPACE = 'dsh-memory-pilot';
@@ -8,6 +9,13 @@ const ALLOWED_FIELDS = new Set([
   'enabled', 'decisionEnabled', 'workspacePath', 'projectId', 'actorId', 'workspaceId',
   'decisionBaseUrl', 'decisionModel', 'decisionProtocol', 'decisionKeyEnv', 'decisionApiKey', 'budgetMs',
   'captureBudgetMs', 'backends', 'scopeOverrides',
+  // Editable criteria and the switches that govern them. These are writable from the
+  // panel because the criteria are the entire source of accuracy — a user who knows
+  // what "worth remembering" means in their own work must be able to say so without
+  // waiting for a release.
+  'decisionPoints', 'disabledPoints',
+  'safetyEnabled', 'safetyTier', 'safetyAskSeverities', 'safetyRecordUnasked',
+  'distillEnabled', 'distillTurnThreshold', 'distillBudgetMs',
 ]);
 
 function fail(code, message) {
@@ -55,7 +63,7 @@ function validOps(ops) {
     && ALLOWED_FIELDS.has(op.path[0]));
 }
 
-export function createSettingsRpcHandler(settings, { discover, createBank, testConnection, residentMemory, onAudit = () => {} } = {}) {
+export function createSettingsRpcHandler(settings, { discover, createBank, testConnection, residentMemory, activity, points, onAudit = () => {} } = {}) {
   const safeDiscover = typeof discover === 'function' ? discover : async () => ({ workspacePath: '', repositories: [], banks: [] });
   const safeCreateBank = typeof createBank === 'function' ? createBank : async () => { throw new Error('Bank creation unavailable'); };
   const safeTestConnection = typeof testConnection === 'function' ? testConnection : async () => { throw new Error('Connection testing unavailable'); };
@@ -118,6 +126,34 @@ export function createSettingsRpcHandler(settings, { discover, createBank, testC
       }
       catch (error) {
         return fail('test-failed', error instanceof Error && error.message ? error.message : 'MemoryPilot connection test failed');
+      }
+    }
+    if (endpoint === 'activity') {
+      // The answer to "is memory actually working". A user could not tell a
+      // retrieval that found nothing from one that failed, because both produced
+      // the same empty context; this endpoint is that difference made visible.
+      if (payload && (typeof payload !== 'object' || Array.isArray(payload) || Object.keys(payload).length)) {
+        return fail('bad-request', 'Invalid MemoryPilot activity request');
+      }
+      try {
+        const rows = typeof activity === 'function' ? activity() : [];
+        return { ok: true, value: { rows: Array.isArray(rows) ? rows : [], summary: summarizeActivity(rows) } };
+      } catch {
+        return fail('activity-failed', 'MemoryPilot activity could not be read');
+      }
+    }
+    if (endpoint === 'points') {
+      // The editable declarations. Each row carries its criteria so the settings
+      // panel can show and edit them; the runtime reads the same objects, which is
+      // what makes an edit effective rather than cosmetic.
+      if (payload && (typeof payload !== 'object' || Array.isArray(payload) || Object.keys(payload).length)) {
+        return fail('bad-request', 'Invalid MemoryPilot decision point request');
+      }
+      try {
+        const list = typeof points === 'function' ? points() : [];
+        return { ok: true, value: Array.isArray(list) ? list : [] };
+      } catch {
+        return fail('points-failed', 'MemoryPilot decision points could not be read');
       }
     }
     if (endpoint === 'resident-get') {

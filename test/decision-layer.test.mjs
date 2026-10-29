@@ -33,8 +33,8 @@ test('independent judgments group into one stage, dependent ones do not', () => 
   const stages = planStages([
     { name: 'read' },
     { name: 'write' },
-    { name: 'mode', after: ['read'] },
-    { name: 'project', after: ['mode'] },
+    { name: 'mode', depends: ['read'] },
+    { name: 'project', depends: ['mode'] },
   ]);
   assert.equal(stages.length, 3);
   assert.deepEqual(stages[0].map(s => s.name).sort(), ['read', 'write']);
@@ -43,8 +43,8 @@ test('independent judgments group into one stage, dependent ones do not', () => 
 });
 
 test('a dependency cycle is a declaration error, not a runtime guess', () => {
-  assert.throws(() => planStages([{ name: 'a', after: ['b'] }, { name: 'b', after: ['a'] }]), /cycle/i);
-  assert.throws(() => planStages([{ name: 'a', after: ['missing'] }]), /unknown dependency/i);
+  assert.throws(() => planStages([{ name: 'a', depends: ['b'] }, { name: 'b', depends: ['a'] }]), /cycle/i);
+  assert.throws(() => planStages([{ name: 'a', depends: ['missing'] }]), /unknown dependency/i);
 });
 
 test('an answer outside the offered options is rejected', () => {
