@@ -343,7 +343,13 @@ export function apply(ctx, config) {
       if (!accepted) throw new Error('No backend accepted the write');
       return {status:'ok',accepted};
     } : null;
-    const runtime = { registry, orchestrator, retentionRouter, directRetrieve, directRetain, autonomous: !usesDecision };
+    // `decision` must be on the runtime object. Three call sites read it — tool
+    // safety, session distillation, and the retention router — and it used to be
+    // omitted, so `runtime.decision` was `undefined` and both the per-call veto and
+    // distillation silently never ran. That is precisely the failure mode this change
+    // set exists to remove: wiring that exists but is unreachable looks present in
+    // every test that injects its own collaborator.
+    const runtime = { registry, orchestrator, retentionRouter, directRetrieve, directRetain, decision, autonomous: !usesDecision };
     runtimes.set(key, runtime);
     debug(`memory runtime built for ${identity.projectId}:${identity.workspaceId} mode=${usesDecision ? 'decision' : 'autonomous'}`);
     return runtime;
