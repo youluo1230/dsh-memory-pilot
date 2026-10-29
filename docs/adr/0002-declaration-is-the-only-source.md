@@ -42,6 +42,8 @@
 
 **必须守住的一条**：判断点的启用与否必须可验证。一个声明存在但运行时从不加载的判断点，是一种最难发现的失效——它看起来在，实际什么都没判过。审计里那两条记忆判断点正是这么静默失效的。
 
+这条在本期实施中又犯了三次（声明没传进适配器、`runtime.decision` 没挂上、用户声明被追加而非替换），**全部通过行为测试**。原因是结构性的：行为测试必须注入协作者，而"生产忘了接某个协作者"正是夹具替你接上的那一个。执行方式是 `test/wiring-contract.test.mjs` 与 `docs/agents/wiring-checks.md`：不做注入，直接看装配后的产物，并且用「改一条判据再比对」来区分声明与内置回退。
+
 ## 相关
 
 - `GLOSSARY.md`：Decision point、Declaration source、Non-memory decision point、Judged state
