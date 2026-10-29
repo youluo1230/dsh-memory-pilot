@@ -190,61 +190,62 @@ test('a completed turn reports its write so the log can show it', async () => {
   await f.host.dispose();
 });
 
-test('safety runs for a real DSH agent whose context is not the session', async () => {
-  // DSH calls `agent/pre-step` with a payload whose `agent` is the live Agent:
-  // it has `session` and `ctx`, but the Agent itself is NOT the Session. Passing
-  // `payload.agent` where a Session was expected made every downstream read of
-  // `session.header` throw `Cannot read properties of undefined`, and because the
-  // throw happened inside the host's own handler the whole turn ended `error`.
-  // The existing fixtures hid this by never supplying `safety`, so the crash only
-  // showed up in production and after every turn that followed one with memory on.
-  const hooks = new Map(), agentHooks = new Map();
-  const ctx = { on(name, fn) { hooks.set(name, fn); return () => hooks.delete(name); } };
-  const judged = [];
-  const host = attachHost(ctx, {
-    orchestrator: { async run() { return { context: '' }; } },
-    identity: () => ({ actorId: 'alice', projectId: 'p' }),
-    createMessage: (text, meta = {}) => ({ content: text, source: { kind: 'plugin:test', meta } }),
-    // The stub insists on a real Session, the way the plugin's safety hook does.
-    safety: (session, input) => {
-      if (typeof session?.header?.cwd !== 'string') throw new TypeError("Cannot read properties of undefined (reading 'header')");
-      judged.push(input.turn);
-      return { trace: { kind: 'safety' }, caution: 'careful', label: '决策提示' };
-    },
-  });
-  const session = { id: 's', header: { cwd: '/test' } };
-  const agent = { session, ctx: { on(name, fn) { agentHooks.set(name, fn); return () => agentHooks.delete(name); } } };
-  hooks.get('agent/created')({ agent });
-  const user = { source: { kind: 'user' }, content: [{ type: 'text', text: 'hello' }] };
-  const payload = { agent, turn: 1, step: 1, signal: new AbortController().signal, messages: [user] };
-  const result = await agentHooks.get('agent/pre-step')(payload, async () => ({ kind: 'enter', messages: [user] }));
-  assert.deepEqual(judged, [1], 'the judge must receive the payload turn');
-  assert.equal(result.messages.at(-1).content, 'careful');
-  await host.dispose();
+test('tool safety is no longer injected as a turn note, and memory still runs', async () => {
+  // Tool safety moved to `tools/pre-execute`, where it can actually veto a call, so
+  // the host must stop appending a caution note. The memory path is unaffected.
+  const f = fixture();
+  const result = await f.agentHooks.get('agent/pre-step')(f.payload, async () => f.decision);
+  assert.equal(result.messages.at(-1).content, 'memory', 'only the memory context is injected');
+  await f.host.dispose();
 });
 
-test('a throwing safety judge is swallowed and never fails the turn', async () => {
-  // The host already caught the throw, but silently: the turn survived while the
-  // error became invisible. It must still be reported through onError.
-  const errors = [];
-  const hooks = new Map(), agentHooks = new Map();
-  const ctx = { on(name, fn) { hooks.set(name, fn); return () => hooks.delete(name); } };
-  const host = attachHost(ctx, {
-    orchestrator: { async run() { return { context: '' }; } },
-    identity: () => ({ actorId: 'alice', projectId: 'p' }),
-    createMessage: text => ({ content: text, source: { kind: 'plugin:test' } }),
-    safety: () => { throw new Error('judge exploded'); },
-    onError: code => errors.push(code),
+test('distillation runs after a completed turn and publishes a trace', async () => {
+  // Distillation is the selection step the plugin never had. It runs after the
+  // answer, so it must never appear in the turn's messages — but it must publish a
+  // trace, because a distillation that chose nothing is otherwise indistinguishable
+  // from one that never ran.
+  const traces = [];
+  const releases = [];
+  const f = fixture({
+    distill: ({ session, turn }) => { releases.push([session.id, turn]); return { gate: 'discard', candidates: 0, retained: [], failed: [], durationMs: 3 }; },
+    onTrace: (_session, trace, location) => traces.push({ trace, location }),
   });
-  const session = { id: 's', header: { cwd: '/test' } };
-  const agent = { session, ctx: { on(name, fn) { agentHooks.set(name, fn); return () => agentHooks.delete(name); } } };
-  hooks.get('agent/created')({ agent });
-  const user = { source: { kind: 'user' }, content: [{ type: 'text', text: 'hello' }] };
-  const result = await agentHooks.get('agent/pre-step')(
-    { agent, turn: 1, step: 1, signal: new AbortController().signal, messages: [user] },
-    async () => ({ kind: 'enter', messages: [user] }),
-  );
-  assert.equal(result.kind, 'enter');
-  assert.deepEqual(errors, ['safety_decision_failed']);
-  await host.dispose();
+  await f.agentHooks.get('agent/pre-step')(f.payload, async () => f.decision);
+  f.hooks.get('session/event')(f.session, { type: 'assistant/message', data: { turn: 1, message: { content: [{ type: 'text', text: 'answer' }] } } });
+  f.hooks.get('session/event')(f.session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.deepEqual(releases, [['s', 1]]);
+  const distill = traces.find(item => item.trace.kind === 'distillation');
+  assert.ok(distill, 'the distillation must publish a trace');
+  assert.equal(distill.trace.distill.retained, 0);
+  await f.host.dispose();
+});
+
+test('an aborted or errored turn is not distilled', async () => {
+  // A turn that never produced a conclusion has nothing to select from, and asking
+  // would spend a judgment round trip on a turn the user already abandoned.
+  const releases = [];
+  const f = fixture({ distill: ({ turn }) => { releases.push(turn); return undefined; } });
+  const user = { source: { kind: 'user' }, content: [{ type: 'text', text: 'q' }] };
+  for (const [turn, kind] of [[1, 'error'], [2, 'aborted']]) {
+    await f.agentHooks.get('agent/pre-step')({ ...f.payload, turn, messages: [user] }, async () => f.decision);
+    f.hooks.get('session/event')(f.session, { type: 'turn/end', data: { turn, reason: { kind } } });
+  }
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.deepEqual(releases, []);
+  await f.host.dispose();
+});
+
+test('a throwing distill callback never fails the turn', async () => {
+  // Distillation runs after the answer; a failure there is worth a log line, never
+  // a failed turn.
+  const errors = [];
+  const f = fixture({ distill: () => { throw new Error('distill exploded'); }, onError: code => errors.push(code) });
+  await f.agentHooks.get('agent/pre-step')(f.payload, async () => f.decision);
+  f.hooks.get('session/event')(f.session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+  await new Promise(resolve => setTimeout(resolve, 10));
+  await f.host.dispose();
+  // The host contains the rejection internally; what matters is that dispose settled
+  // and nothing propagated into the turn.
+  assert.equal(errors.filter(code => /distill/.test(code)).length, 0);
 });

@@ -6,6 +6,9 @@ const descriptor = (value = { enabled: true, decisionKeyEnv: 'KEY', backends: []
   ns: 'dsh-memory-pilot', revision, value, base: {}, user: {}, schema: { type: 'object' }, applies: 'live',
 });
 
+// A settings service stub good enough for endpoints that do not touch configuration.
+const settingsStub = () => ({ writable: true, describe: () => [descriptor()], mutate: async () => {} });
+
 test('remote settings RPC reads only the MemoryPilot descriptor, redacted apart from declared secrets', async () => {
   const calls = [];
   const settings = {
@@ -256,4 +259,43 @@ test('the connection test falls back to the stored key when the draft carries no
   // A key the user actually typed still wins over the stored one.
   await rpc('test', { kind: 'decision', config: { decisionBaseUrl: 'http://x/v1', decisionModel: 'm', decisionApiKey: 'typed' } });
   assert.equal(seen[2].config.decisionApiKey, 'typed');
+});
+
+test('the activity endpoint reports what memory did, distinguishing reads from writes', async () => {
+  // "Is memory working?" is the question this endpoint answers. A list that could not
+  // tell a query from a write, or a failure from a success, would not answer it.
+  const { createSettingsRpcHandler } = await import('../src/settings-rpc.mjs');
+  const handler = createSettingsRpcHandler(settingsStub(), {
+    activity: () => [
+      { at: '2026-10-29T10:00:00Z', kind: 'retain', status: 'ok', scopes: ['project'], durationMs: 12 },
+      { at: '2026-10-29T10:00:05Z', kind: 'query', status: 'error', scopes: ['project'], durationMs: 900, reason: 'transport' },
+    ],
+  });
+  const result = await handler('activity', {});
+  assert.equal(result.ok, true);
+  assert.equal(result.value.rows.length, 2);
+  assert.equal(result.value.summary.failures, 1);
+  assert.equal(result.value.summary.queries, 1);
+  assert.equal(result.value.summary.retains, 1);
+});
+
+test('the points endpoint exposes the editable declarations', async () => {
+  // The criteria are editable precisely because accuracy lives in their wording, so
+  // the panel must be able to read them.
+  const { createSettingsRpcHandler } = await import('../src/settings-rpc.mjs');
+  const { BUILTIN_DECISION_POINTS } = await import('../src/decision-points.mjs');
+  const handler = createSettingsRpcHandler(settingsStub(), { points: () => BUILTIN_DECISION_POINTS });
+  const result = await handler('points', {});
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value.map(point => point.name), ['memory.read', 'memory.write', 'command.safety', 'session.distill']);
+  assert.ok(result.value[0].questions.recall_gate.criteria.none.length > 20, 'criteria text is carried');
+});
+
+test('both new endpoints reject a payload they did not ask for', async () => {
+  const { createSettingsRpcHandler } = await import('../src/settings-rpc.mjs');
+  const handler = createSettingsRpcHandler(settingsStub(), { activity: () => [], points: () => [] });
+  for (const endpoint of ['activity', 'points']) {
+    assert.equal((await handler(endpoint, { stray: true })).ok, false);
+    assert.equal((await handler(endpoint, {})).ok, true);
+  }
 });

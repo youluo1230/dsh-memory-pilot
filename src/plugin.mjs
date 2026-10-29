@@ -6,12 +6,18 @@ import { acceptsWorkspacePath, bindingsForIdentity, detectIdentity, matchWorkspa
 import { createOpenAICompatibleDecision, createSystemOneDecision } from './adapters.mjs';
 import { createRegistry } from './registry.mjs';
 import { attachHost } from './host.mjs';
-import { createSafetyJudge, loadDecisionPoints } from './decision-points.mjs';
+import { BUILTIN_DECISION_POINTS, commandSafety, loadDecisionPoints, memoryRead, memoryWrite, sessionDistill } from './decision-points.mjs';
+import { askPoint } from './decision-executor.mjs';
+import { createToolGuard, createMonotonicRefusal, callFamily } from './tool-guard.mjs';
+import { createDistillTrigger, cutCandidates, distillTurn } from './distillation.mjs';
+import { createActivityLog, summarizeActivity } from './activity.mjs';
+import { residentDigestOf } from './memory-landings.mjs';
+import { resolveAutomationTier } from './decision-layer.mjs';
 import { installSettingsRpc } from './settings-rpc.mjs';
 import { testDecisionConnection, testSystemConnection } from './connection-test.mjs';
 import { registerMemoryTools } from './tools.mjs';
 import { createResidentMemory } from './resident-memory.mjs';
-import { createRetentionRouter } from './retention-router.mjs';
+import { createRetentionRouter, safeReason } from './retention-router.mjs';
 import { resolveApiKey } from './secret.mjs';
 import { createDecisionTrail, toDecisionEntry } from './trail.mjs';
 
@@ -67,12 +73,28 @@ export const Config = Schema.object({
   decisionBaseUrl: Schema.string().default('').volatile(),
   decisionModel: Schema.string().default('').volatile(),
   decisionProtocol: Schema.union(['systemone', 'openai']).default('systemone').volatile(),
-  // On by default: the caution note is advisory and cheap, so requiring an opt-in
-  // would mean most users never see it. A user who finds it noisy turns it off.
+  // Tool safety now intercepts at `tools/pre-execute` instead of advising at turn
+  // level. On by default because a per-call veto that is off is worse than one that
+  // is on and occasionally noisy — the noise is one approval prompt, the silence is
+  // a deleted file.
   safetyEnabled: Schema.boolean().default(true),
+  // The author's default for the safety point, and the ceiling on how autonomous a
+  // user may make it. A user can tighten (`silent-visible`/`ask`); the resolver
+  // clamps anything looser back to the author's tier.
+  safetyTier: Schema.union(['silent', 'silent-visible', 'ask']).default('ask'),
+  // Whether a severity the tier decided not to ask about still leaves a record.
+  safetyRecordUnasked: Schema.boolean().default(true),
   // User-declared decision points. Validated with the same rules as the built-in
   // ones, so a broken declaration fails at load instead of judging nonsense.
   decisionPoints: Schema.any().default([]),
+  // Session distillation: selecting what a finished conversation concluded, rather
+  // than storing the whole conversation stream. Off-feed by default is wrong here —
+  // the plugin's whole complaint was that it only ever queried — so this defaults on.
+  distillEnabled: Schema.boolean().default(true),
+  // The fallback for a conversation that is never archived. Zero disables it, which
+  // makes archiving the only trigger.
+  distillTurnThreshold: Schema.number().min(0).max(200).default(8),
+  distillBudgetMs: Schema.number().min(100).max(300000).default(30000).volatile(),
   decisionKeyEnv: Schema.string().default('MEMORY_DECISION_API_KEY').volatile(),
   // Literal key fallback. Many deployments cannot inject env vars into the DSH
   // service, so the settings panel must be able to hold the key itself. When
@@ -97,9 +119,31 @@ export const Config = Schema.object({
   captureBudgetMs: Schema.number().min(100).max(300000).default(60000).volatile(),
 });
 
+/**
+ * Normalize the user's declared decision points into an array.
+ *
+ * The setting is free-form (`Schema.any()`) because a declaration is a document,
+ * not a scalar. A malformed one must fail loudly at load — that is the whole point
+ * of validating — so this only shapes the value, never repairs it.
+ */
+export function normalizeDeclarations(value) {
+  if (Array.isArray(value)) return value.filter(item => item && typeof item === 'object');
+  if (value && typeof value === 'object') return [value];
+  return [];
+}
+
 export function apply(ctx, config) {
   debug('apply called');
   const current = () => resolveConfig(config);
+  // The recent-activity record lives for the whole plugin lifetime so a user can ask
+  // "is this working" after any number of turns.
+  const activity = createActivityLog({ limit: 50 });
+  // The declarations the settings panel may edit. The runtime reads these objects,
+  // so a change here is a change to behaviour rather than to a display.
+  const declaredPoints = () => loadDecisionPoints([
+    memoryRead, memoryWrite, commandSafety, sessionDistill,
+    ...(normalizeDeclarations(current().decisionPoints)),
+  ]);
   const residentMemory = createResidentMemory();
   const residentSnapshots = new WeakMap();
   const residentLoads = new WeakMap();
@@ -280,6 +324,10 @@ export function apply(ctx, config) {
   const disposeSettingsRpc = installSettingsRpc(ctx, {
     getConfig: current,
     residentMemory,
+    // "Is memory working?" — the rows distinguish a query from a write, and each
+    // carries its outcome, so a silent failure stops looking like an empty result.
+    activity: () => activity.list(),
+    points: () => declaredPoints(),
     resolveIdentity: reference => identityFor({ header: { cwd: resolveProjectRef(reference) } }),
     onAudit: record => log('info', `MemoryPilot ${JSON.stringify(record)}`),
     // One-shot probes for the settings UI "测试" buttons. They receive the
@@ -321,6 +369,12 @@ export function apply(ctx, config) {
     retrieveBudgetMs: current().captureBudgetMs ?? 60000, rememberBudgetMs: current().captureBudgetMs ?? 60000 });
   const personaDisposers = new Map();
   const disposePersona = ctx.on('agent/created', ({ agent }) => {
+    // Track the live agent for the session, so a tool-safety approval can name the
+    // agent it asks on behalf of and the archive hook can recover the conversation.
+    if (agent?.session) {
+      agents.set(agent.session, agent);
+      liveSessions.set(String(agent.session.id), agent.session);
+    }
     if (!agent?.ctx?.on) return;
     const off = agent.ctx.on('system-prompt/assemble', async (_assembly, _context, next) => {
       const snapshot = acceptsSession(agent.session) ? await snapshotFor(agent.session) : undefined;
@@ -332,7 +386,30 @@ export function apply(ctx, config) {
   });
   const disposePersonaSession = ctx.on('session/disposed', session => {
     for (const [agent, off] of personaDisposers) if (agent.session === session) { off?.(); personaDisposers.delete(agent); }
+    agents.delete(session);
+    liveSessions.delete(String(session.id));
   });
+  // Accumulate the transcript for archive-time distillation. Bounded to the last
+  // few turns: an archived session can span hours, and distillation judges the
+  // conclusions near its end rather than reliving the whole log.
+  const accumulate = (session, event) => {
+    // The two events carry their payload differently: `user/message` IS the message,
+    // while `assistant/message` wraps it with turn/step. Reading the wrong one
+    // produced an empty transcript, so archive-time distillation had nothing to cut.
+    const message = event?.type === 'user/message' ? event : event?.data?.message;
+    const turn = Number.isSafeInteger(event?.data?.turn) ? event.data.turn : undefined;
+    if (!message) return;
+    const entry = sessionTranscript.get(session.id) ?? { userText: '', assistantText: '', turn: 0 };
+    if (turn !== undefined) entry.turn = turn;
+    const body = Array.isArray(message.content)
+      ? message.content.filter(part => part?.type === 'text').map(part => part.text ?? '').join('\n')
+      : '';
+    if (!body.trim()) return;
+    if (event.type === 'user/message') entry.userText = body.slice(0, 2000);
+    if (event.type === 'assistant/message') entry.assistantText = body.slice(0, 4000);
+    sessionTranscript.set(session.id, entry);
+  };
+  const disposeAccumulate = ctx.on('session/event', accumulate);
   // Publish decisions to the Trajectory through the supported projection channel.
   // Registration is an effect on this fiber, so unloading the plugin removes the
   // key and Clients read it as capability absence instead of showing stale rows.
@@ -341,6 +418,232 @@ export function apply(ctx, config) {
   ctx.inject(['sessionProjections'], projectionCtx => {
     projectionCtx.effect(() => projectionCtx.sessionProjections.register(trail.definition), 'dsh-memory-pilot: decision trail projection');
   });
+  // ---------------------------------------------------------------------------
+  // Session distillation
+  // ---------------------------------------------------------------------------
+  const distillTrigger = createDistillTrigger({
+    threshold: () => Number(current().distillTurnThreshold) || 0,
+    enabled: () => current().distillEnabled !== false,
+  });
+
+  /**
+   * Run distillation for one finished turn.
+   *
+   * Two things are deliberately kept out of the hot path: the judgment round trip
+   * and the writes that follow it. Both run from a task the host does not await on
+   * the turn path — the user already has their answer — and the archive hook is the
+   * only place that waits, because an archive is a durability boundary.
+   */
+  const runDistillation = async ({ session, turn, userText, assistantText, reason, runtime, thresholdFire, force = false }) => {
+    if (disposed) return undefined;
+    if (!force && !thresholdFire) {
+      // Every turn still gets a gate question, but only once the threshold fires do
+      // we run the per-candidate selection. Below the threshold the turn is
+      // remembered by resident capture, not distilled.
+      // (The threshold is the only cheap way to bound cost per turn.)
+    }
+    const candidates = cutCandidates({ userText, assistantText, reason: reason?.kind });
+    if (!candidates.length) return { gate: 'discarded', candidates: 0, retained: [], failed: [], durationMs: 0, reason: 'no-candidates', candidateTexts: [] };
+    const snapshot = residentSnapshots.get(session);
+    const startedAt = performance.now();
+    try {
+      const report = await distillTurn({
+        turn: { userText, assistantText, reason: reason?.kind },
+        candidates,
+        resident: snapshot?.resident ?? {},
+        decideBatch: async ({ state, questions }) => {
+          const [response] = await runtime.decision.decideBatch([{ id: 'session.distill', state, questions }], { signal: AbortSignal.timeout(distillBudget()) });
+          const answers = {};
+          for (const name of Object.keys(questions)) {
+            const answer = response?.answers?.[name];
+            if (!answer || typeof answer.choice !== 'string') continue;
+            if (!Object.hasOwn(questions[name].criteria, answer.choice)) continue;
+            answers[name] = answer.choice;
+          }
+          return answers;
+        },
+        retain: async ({ candidate, key, forceExternal }) => {
+          const target = forceExternal ? 'external'
+            : pickDistillTarget({ candidate, resident: snapshot?.resident ?? {} });
+          if (target === 'external') return { target: 'external', status: 'ok', ...(await retainExternal(session, candidate)) };
+          const saved = await retainResident({ session, target, key: key ?? undefined, content: candidate.text });
+          return { target, status: saved?.degraded ? 'degraded' : 'ok' };
+        },
+      });
+      report.candidateTexts = candidates.map(candidate => candidate.text.slice(0, 200));
+      const durationMs = Math.max(0, performance.now() - startedAt);
+      report.durationMs = durationMs;
+      activity.record({ kind: 'distill', status: report.retained.length ? 'ok' : 'noop', durationMs,
+        ...(report.retained.length ? { target: report.retained[0].target } : {}),
+        ...(report.failed.length && !report.retained.length ? { status: 'error', reason: report.failed[0].reason } : {}),
+        hitCount: report.retained.length });
+      if (report.failed.length) log('warn', `MemoryPilot distill_partial_failed count=${report.failed.length} reason=${report.failed[0]?.reason ?? 'unknown'}`);
+      return report;
+    } catch (error) {
+      // Distillation runs after the answer, so a failure here must never surface as
+      // a turn error. It must, however, leave a trace: silence was the original bug.
+      const durationMs = Math.max(0, performance.now() - startedAt);
+      log('warn', `MemoryPilot distill_failed reason=${safeReason(error)}`);
+      activity.record({ kind: 'distill', status: 'error', reason: safeReason(error), durationMs });
+      return { gate: 'keep', candidates: candidates.length, retained: [], failed: [{ reason: safeReason(error) }], durationMs, reason: 'failed', candidateTexts: candidates.map(candidate => candidate.text.slice(0, 200)) };
+    }
+  };
+
+  /** Where a distilled candidate belongs. The project is the specific answer for a
+   * repository fact, global memory for a cross-project preference; without any
+   * resident room the external store keeps the detail retrievable. */
+  const pickDistillTarget = ({ candidate, resident }) => {
+    const text = candidate.text ?? '';
+    // A fact naming this repository, or the assistant summarising work done here,
+    // belongs to the project. Otherwise it is about the user across projects.
+    if (resident.project !== undefined || identityFor({ header: { cwd: '' } }).projectId) {
+      // Prefer the project when the candidate mentions a path or the word project.
+      if (/\b(project|repo(sitory)?|这(个)?(项目|仓库)|代码库)\b/i.test(text)) return 'project-memory';
+    }
+    if (resident.user !== undefined) return 'user';
+    return 'global-memory';
+  };
+
+  const retainResident = async ({ session, target, key, content }) => {
+    const identity = identityFor(session);
+    const snapshot = residentSnapshots.get(session);
+    const revisionKey = { user: 'user', 'global-memory': 'global', 'project-memory': 'project' }[target];
+    const expected = snapshot?.writeRevisions?.[revisionKey];
+    try {
+      const saved = await residentMemory.apply({ target, key: key ?? `distilled-${Date.now()}`, content, actor: 'agent' }, expected, identity);
+      if (snapshot?.writeRevisions && typeof saved?.revision === 'string') snapshot.writeRevisions[revisionKey] = saved.revision;
+      return saved;
+    } catch (error) {
+      // A full file degrades to the external store rather than losing the fact.
+      throw error;
+    }
+  };
+
+  const retainExternal = async (session, candidate) => {
+    const runtime = runtimeFor(session);
+    if (!runtime?.directRetain) return { accepted: 0 };
+    const identity = identityFor(session);
+    const event = { ...identity, sessionId: session.id, id: `distill:${Date.now()}`, type: 'turn_end', text: candidate.text };
+    try { await runtime.directRetain(event, { budgetMs: distillBudget() }); return { accepted: 1 }; }
+    catch (error) { throw error; }
+  };
+
+  const distillBudget = () => Number(current().distillBudgetMs) || 30000;
+
+  // ---------------------------------------------------------------------------
+  // Tool safety, at the per-call extension point
+  // ---------------------------------------------------------------------------
+  const safetyDenied = new Set();
+  // The trace sink is wired into the host below; the guard runs on tool dispatch,
+  // which is later, so it reads the sink through this holder rather than needing it
+  // at construction time.
+  const traceSink = { current: () => {} };
+  const guardFor = session => {
+    const runtime = runtimeFor(session);
+    if (!runtime?.decision) return undefined;
+    return createToolGuard({
+      judge: async ({ toolName, args, exec }) => {
+        // The declared command.safety point judges the call. It reports severity;
+        // the tier decides whether that severity is worth asking about.
+        const context = `${toolName} ${safeJson(args)}`.slice(0, 2000);
+        const asked = await askPoint(commandSafety, {
+          decision: runtime.decision,
+          state: { context },
+          timeoutMs: Math.min(4000, Number(current().decisionTimeoutMs) || 4000),
+        }).catch(() => undefined);
+        if (!asked) return undefined;
+        const severity = asked.answers.find(answer => answer.name === 'severity')?.choice;
+        if (typeof severity !== 'string') return undefined;
+        try {
+          Promise.resolve(traceSink.current(session, asked.trace, { turn: 0, step: 0, question: context })).catch(() => {});
+        } catch { /* observability must not alter execution */ }
+        const confidence = asked.answers.find(answer => answer.name === 'severity')?.confidence;
+        return { severity, ...(Number.isFinite(confidence) ? { confidence } : {}) };
+      },
+      approve: async ({ toolName, callId, reason, signal }) => {
+        const approval = service('approval');
+        // No approval service means nobody can say yes. Denying is the only honest
+        // answer; assuming yes is how a safety feature quietly stops safetying.
+        if (!approval || typeof approval.request !== 'function') return 'unavailable';
+        try {
+          const outcome = await approval.request({ agent: currentAgentFor(session), toolName, callId, reason, signal });
+          return outcome;
+        } catch { return 'unavailable'; }
+      },
+      tier: () => {
+        // Author tier is the ceiling: a user may only tighten it.
+        try { return resolveAutomationTier({ authorTier: commandSafety.automation, userTier: current().safetyTier ?? commandSafety.automation }); }
+        catch { return commandSafety.automation; }
+      },
+      record: row => {
+        if (current().safetyRecordUnasked === false && row.status === 'allowed') return;
+        activity.record(row);
+      },
+    });
+  };
+  // The current agent per session, for the approval request. An approval must name
+  // the agent it is asked on behalf of, and the tool execution carries it — this map
+  // is only a fallback for the paths that do not.
+  const agents = new Map();
+  const currentAgentFor = session => agents.get(session) ?? (session?.agent ?? undefined);
+  const safeJson = value => {
+    try { const text = JSON.stringify(value); return text === undefined ? '' : text; } catch { return ''; }
+  };
+
+  /**
+   * Publish one decision to the log and the Trajectory projection.
+   *
+   * This is the single sink: the host's turn path, the distillation path and the
+   * tool guard all reach it, so every judgment type is recorded the same way and the
+   * decision record's `kind` is the only thing that differs.
+   */
+  const recordTrace = (session, trace, location = {}) => {
+    if (!trace || typeof trace !== 'object') return;
+    const scope = trace.executions?.[0]?.scope ?? 'none';
+    const engine = trace.executions?.[0]?.engine ?? 'none';
+    const operation = trace.executions?.[0]?.operation ?? 'none';
+    log('info', `MemoryPilot ${trace.kind} ${trace.status}: ${scope} ${engine} ${operation} turn=${location.turn ?? 0}${location.step ? ` step=${location.step}` : ''}`);
+    // Hand the decision to the projection. It is folded into the Session's
+    // published trail by the first committed event of this step, so the
+    // Trajectory shows what the decision model was asked and chose.
+    // Every trace is also an activity row. The Trajectory is for reading a
+    // decision; the activity list answers "has this done anything at all", and a
+    // failed retrieval belongs there even when the turn itself succeeded.
+    try {
+      const rows = Array.isArray(trace.executions) ? trace.executions : [];
+      if (trace.kind === 'retrieval' || trace.kind === 'retention') {
+        for (const row of rows) {
+          activity.record({
+            kind: row.operation === 'write' ? 'retain' : 'query',
+            status: row.response?.status === 'ok' ? 'ok' : (row.response?.status ?? 'error'),
+            scopes: row.scope ? [row.scope] : [],
+            durationMs: Number.isFinite(row.durationMs) ? row.durationMs : 0,
+            ...(Number.isFinite(row.response?.hitCount) ? { hitCount: row.response.hitCount } : {}),
+          });
+        }
+        if (!rows.length) {
+          activity.record({ kind: trace.kind === 'retention' ? 'retain' : 'query',
+            status: trace.status === 'ok' ? 'ok' : (trace.status ?? 'noop'),
+            scopes: [], durationMs: Number.isFinite(trace.totalDurationMs) ? trace.totalDurationMs : 0 });
+        }
+      }
+    } catch { /* observability must not alter execution */ }
+    if (disposed) return;
+    try {
+      trail.record({
+        sessionId: session?.id,
+        ...toDecisionEntry(trace, {
+          id: `${session?.id ?? 'session'}:${location.turn ?? 0}:${location.step ?? 0}:${trace.kind ?? 'decision'}`,
+          turn: location.turn,
+          step: location.step,
+          // The orchestrator records the exact text its decision saw; the
+          // step's user text is a fallback for traces that predate that.
+          question: trace.question ?? location.question ?? '',
+        }),
+      });
+    } catch { /* observability must not alter execution */ }
+  };
+
   const host = attachHost(ctx, {
     orchestratorFor: session => runtimeFor(session)?.orchestrator,
     residentSnapshotFor: snapshotFor,
@@ -370,24 +673,21 @@ export function apply(ctx, config) {
     // was consulted. It gets a short leash of its own: safety advice that arrives
     // after the model already acted is worth nothing, so a slow judgment is
     // dropped rather than awaited.
-    safety: (session, input) => {
+    // Session distillation. This is the selection step the plugin never had: what a
+    // finished conversation concluded, chosen by the judgment layer from candidates
+    // the plugin cut. It runs after the answer, so nothing here can slow a turn.
+    distill: ({ session, turn, userText, assistantText, reason }) => {
+      const resolved = prepared();
+      if (resolved.distillEnabled === false) return undefined;
       const runtime = runtimeFor(session);
       if (!runtime?.decision) return undefined;
-      // A malformed user point must not break every turn, so validation failure
-      // degrades to running only the built-in points.
-      let points = [];
-      try {
-        const declared = current().decisionPoints;
-        if (Array.isArray(declared) && declared.length) points = loadDecisionPoints(declared);
-      } catch { log('warn', 'MemoryPilot decision_point_invalid'); }
-      const judge = createSafetyJudge({
-        decision: runtime.decision,
-        points,
-        enabled: () => current().safetyEnabled !== false && current().decisionEnabled !== false,
-        timeoutMs: Math.min(4000, Number(current().decisionTimeoutMs) || 4000),
-      });
-      return judge(session, input);
+      // The threshold fallback exists because most conversations are never
+      // archived. Without it, closing the browser loses everything since the last
+      // explicit end-of-session signal.
+      const thresholdFire = distillTrigger.countTurn(session.id, { durable: reason?.kind !== 'aborted' });
+      return runDistillation({ session, turn, userText, assistantText, reason, runtime, thresholdFire });
     },
+    capturesTurn: () => current().distillEnabled !== false,
     acceptsSession,
     identity: identityFor,
     // `references` is what makes the Chat UI render a `recall` source as a
@@ -421,36 +721,115 @@ export function apply(ctx, config) {
       const sources = Object.entries(snapshot.resident).filter(([,value])=>Boolean(value)).map(([scope,value])=>`${scope}:${value.length}`).join(',') || 'none';
       log('info', `MemoryPilot resident memory loaded turn=${location.turn ?? 0} sources=${sources} soul=${Boolean(snapshot.soul)}`);
     },
-    onTrace: (session, trace, location = {}) => {
-      const scope = trace.executions?.[0]?.scope ?? 'none';
-      const engine = trace.executions?.[0]?.engine ?? 'none';
-      const operation = trace.executions?.[0]?.operation ?? 'none';
-      log('info', `MemoryPilot ${trace.kind} ${trace.status}: ${scope} ${engine} ${operation} turn=${location.turn ?? 0}${location.step ? ` step=${location.step}` : ''}`);
-      // Hand the decision to the projection. It is folded into the Session's
-      // published trail by the first committed event of this step, so the
-      // Trajectory shows what the decision model was asked and chose.
-      if (!disposed) {
-        try {
-          trail.record({
-            sessionId: session?.id,
-            ...toDecisionEntry(trace, {
-              id: `${session?.id ?? 'session'}:${location.turn ?? 0}:${location.step ?? 0}:${trace.kind ?? 'decision'}`,
-              turn: location.turn,
-              step: location.step,
-              // The orchestrator records the exact text its decision saw; the
-              // step's user text is a fallback for traces that predate that.
-              question: trace.question ?? location.question ?? '',
-            }),
-          });
-        } catch { /* observability must not alter execution */ }
-      }
-    },
+    onTrace: recordTrace,
     onError: code => log('warn', `MemoryPilot ${code}`),
   });
+  // The tool guard judges on tool dispatch, which happens after this point; it
+  // publishes through the same sink the host uses so tool-safety decisions reach
+  // the decision log rather than existing only in memory.
+  traceSink.current = recordTrace;
+  // Which live session each id refers to. The archive hook receives only an id, so
+  // this map is how it recovers the conversation it is about to close.
+  const liveSessions = new Map();
+  const liveSessionFor = sessionId => liveSessions.get(String(sessionId));
+  // The accumulated conversation per session, for the archive-time distillation.
+  // Bounded by turn: a long session keeps only its most recent turns, because the
+  // conclusions that matter are near the end and the judged state has a hard
+  // character cap anyway.
+  const sessionTranscript = new Map();
+  /**
+   * Distill a whole conversation when it is archived.
+   *
+   * The turn threshold exists for conversations that are never archived; this is
+   * the strong signal. It uses the accumulated transcript of the session rather than
+   * one turn, because an archive is the moment the conversation as a whole becomes a
+   * closed unit and its conclusions are what matter.
+   */
+  const archiveDistill = async session => {
+    const transcript = sessionTranscript.get(session.id);
+    if (!transcript || (!transcript.userText && !transcript.assistantText)) return undefined;
+    const runtime = runtimeFor(session);
+    if (!runtime?.decision) return undefined;
+    const report = await runDistillation({
+      session, turn: transcript.turn ?? 0,
+      userText: transcript.userText, assistantText: transcript.assistantText,
+      reason: { kind: 'archived' }, runtime, thresholdFire: true, force: true,
+    });
+    if (report?.retained?.length) log('info', `MemoryPilot distilled_on_archive retained=${report.retained.length}`);
+    return report;
+  };
+
+  // ---------------------------------------------------------------------------
+  // `tools/pre-execute`: the per-call veto
+  // ---------------------------------------------------------------------------
+  // This is the extension point the docs wrongly said did not exist. Being here
+  // instead of at `agent/pre-step` is the change that turns the safety judgment from
+  // advice the model may ignore into a decision the registry enforces.
+  const disposeToolGate = ctx.on('tools/pre-execute', async (exec, next) => {
+    if (disposed) return next();
+    try {
+      const session = exec?.agent?.session;
+      if (!session || !acceptsSession(session)) return next();
+      if (current().safetyEnabled === false || current().decisionEnabled === false) return next();
+      const guard = guardFor(session);
+      if (!guard) return next();
+      const decision = await guard.gate(exec);
+      // A refusal is remembered so the monotonic guard can hold it: a downstream
+      // listener returning `allow` must not be able to undo our denial.
+      if (decision.kind === 'deny') safetyDenied.add(callFamilyOf(exec));
+      return decision.kind === 'allow' ? next() : decision;
+    } catch {
+      // A gate that throws must not fail the tool call; the registry's own default
+      // applies. The failure is still visible through the activity list.
+      log('warn', 'MemoryPilot tool_gate_failed');
+      return next();
+    }
+  });
+  const callFamilyOf = exec => {
+    try { return callFamily(exec?.name, exec?.arguments); } catch { return String(exec?.name ?? 'unknown'); }
+  };
+  const disposeGuard = ctx.effect
+    ? ctx.effect(() => {
+        // The monotonic layer: it can only deny, so no later listener can turn a
+        // refusal back into permission.
+        const tools = service('tools');
+        if (!tools || typeof tools.guard !== 'function') return () => {};
+        return tools.guard(createMonotonicRefusal(safetyDenied));
+      })
+    : () => {};
+
+  // ---------------------------------------------------------------------------
+  // End of session: the archive signal
+  // ---------------------------------------------------------------------------
+  // Archiving is the user saying "this conversation is over", and it is the only
+  // end-of-session signal the platform offers. It is also awaitable before the
+  // archive set is written, which is what lets distillation finish while the
+  // session's context is still live.
+  const disposeArchive = ctx.on('workspace/session-activity', async (request, next) => {
+    if (disposed) return next();
+    const sessionId = request?.sessionId;
+    if (!sessionId || current().distillEnabled === false) return next();
+    const session = liveSessionFor?.(sessionId);
+    if (!session) return next();
+    try {
+      await archiveDistill(session);
+      distillTrigger.markArchived(sessionId);
+    } catch (error) {
+      // A failed distillation must not block the archive: the user asked to close
+      // the conversation, not to guarantee a judgment succeeded.
+      log('warn', `MemoryPilot distill_on_archive_failed reason=${safeReason(error)}`);
+    }
+    return next();
+  });
+
   ctx.on('dispose', async () => {
     // Stand down first: in-flight captures and pending snapshots are awaited
     // below, and they must see a disposed plugin before they touch any service.
     disposed = true;
+    disposeToolGate?.();
+    disposeGuard?.();
+    disposeArchive?.();
+    disposeAccumulate?.();
     disposeSettingsRpc?.();
     disposeTools?.();
     disposePersona?.();

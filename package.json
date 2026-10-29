@@ -22,7 +22,14 @@
     "./retention-router": "./src/retention-router.mjs",
     "./client": "./lib/client.js",
     "./package.json": "./package.json",
-    "./trail": "./src/trail.mjs"
+    "./trail": "./src/trail.mjs",
+    "./decision-layer": "./src/decision-layer.mjs",
+    "./decision-points": "./src/decision-points.mjs",
+    "./decision-executor": "./src/decision-executor.mjs",
+    "./distillation": "./src/distillation.mjs",
+    "./tool-guard": "./src/tool-guard.mjs",
+    "./activity": "./src/activity.mjs",
+    "./memory-landings": "./src/memory-landings.mjs"
   },
   "files": [
     "src",
@@ -35,7 +42,7 @@
   ],
   "scripts": {
     "test": "node --test",
-    "check": "node --check src/core.mjs && node --check src/adapters.mjs && node --check src/host.mjs && node --check src/plugin.mjs && node --check src/registry.mjs && node --check src/memos-http.mjs && node --check src/memos-bridge.mjs && node --check src/settings-rpc.mjs && node --check src/discovery.mjs && node --check src/configuration.mjs && node --check src/tools.mjs && node --check src/connection-test.mjs && node --check src/secret.mjs && node --check src/trail.mjs && node --check src/resident-targets.mjs && node --check src/resident-memory.mjs && node --check src/retention-router.mjs && node --check lib/client.js"
+    "check": "node --check src/core.mjs && node --check src/adapters.mjs && node --check src/host.mjs && node --check src/plugin.mjs && node --check src/registry.mjs && node --check src/memos-http.mjs && node --check src/memos-bridge.mjs && node --check src/settings-rpc.mjs && node --check src/discovery.mjs && node --check src/configuration.mjs && node --check src/tools.mjs && node --check src/connection-test.mjs && node --check src/secret.mjs && node --check src/trail.mjs && node --check src/resident-targets.mjs && node --check src/resident-memory.mjs && node --check src/retention-router.mjs && node --check lib/client.js && node --check src/decision-executor.mjs && node --check src/distillation.mjs && node --check src/tool-guard.mjs && node --check src/activity.mjs && node --check src/memory-landings.mjs"
   },
   "engines": {
     "node": ">=22"

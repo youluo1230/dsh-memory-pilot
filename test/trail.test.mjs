@@ -224,3 +224,42 @@ test('an injected message folded before any pointer exists does not abort the tu
   assert.equal(state.entries.length, 1);
   assert.equal(state.entries[0].turn, 1);
 });
+
+test('the log carries every judgment kind, including distillation and tool safety', async () => {
+  // A decision log that only understood memory judgments would drop the two new
+  // kinds silently — the reader would see rows missing with no error anywhere.
+  const { decisionForLog, distillTrace } = await import('../src/host.mjs');
+  const safety = decisionForLog({
+    subject: 'command.safety', kind: 'safety', status: 'ok',
+    decision: { protocol: 'systemone', model: 'jev', questionNames: ['severity'], answers: { severity: { choice: 'destructive' } }, durationMs: 31 },
+    plan: { actions: [{ backendId: 'none', scope: 'none', operation: 'ask' }] }, executions: [],
+  }, { turn: 2, step: 1, question: 'rm -rf build' });
+  assert.equal(safety.kind, 'safety');
+  assert.equal(safety.subject, 'command.safety');
+  assert.equal(safety.answers[0].choice, 'destructive');
+  assert.equal(safety.decisionDurationMs, 31);
+
+  const distill = decisionForLog(distillTrace({ gate: 'keep', retained: [{ target: 'project-memory' }], failed: [], durationMs: 240, candidateTexts: ['a fact'] }, { turn: 3, question: 'q' }), { turn: 3, step: 0, question: 'q' });
+  assert.equal(distill.kind, 'distillation');
+  assert.equal(distill.subject, 'session.distill');
+  assert.equal(distill.actions[0].backend, 'project-memory');
+});
+
+test('a distillation that selected nothing is recorded rather than dropped', async () => {
+  // The silence that started this work: a judgment that produced nothing looked the
+  // same as a judgment that never ran.
+  const { distillTrace } = await import('../src/host.mjs');
+  const trace = distillTrace({ gate: 'discard', candidates: 4, retained: [], failed: [], durationMs: 12 }, { turn: 1 });
+  assert.equal(trace.kind, 'distillation');
+  assert.equal(trace.distill.candidates, 4);
+  assert.equal(trace.decision.answers.turn_worth_keeping.choice, 'discard');
+});
+
+test('a record written before the new kinds existed still renders', async () => {
+  // Old rows carry only `kind: 'retrieval'` and no subject; they must keep working.
+  const { decisionForLog } = await import('../src/host.mjs');
+  const legacy = decisionForLog({ kind: 'retrieval', status: 'ok' }, { turn: 1, step: 1, question: 'old' });
+  assert.equal(legacy.kind, 'retrieval');
+  assert.equal(legacy.subject, 'memory.read', 'an absent subject degrades to the memory default');
+  assert.deepEqual(legacy.questions, []);
+});
