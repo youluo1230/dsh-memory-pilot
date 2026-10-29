@@ -194,3 +194,25 @@ test('a point of an unclaimed trigger fails loudly instead of silently not runni
     landingFor: point => landingFor(point, {}),
   }), /No landing registered for orphan/);
 });
+
+test('a user declaration replaces the built-in of the same name instead of duplicating it', async () => {
+  // The bug this holds: appending the user's point left two entries named
+  // `memory.read`, and every lookup returned the built-in — so an edited criterion
+  // validated, showed in the settings panel, and changed nothing at runtime.
+  const { mergeDeclarations } = await import('../src/plugin.mjs');
+  const { memoryRead, memoryWrite, commandSafety, sessionDistill } = await import('../src/decision-points.mjs');
+  const builtins = [memoryRead, memoryWrite, commandSafety, sessionDistill];
+  const edited = { ...memoryRead, questions: { ...memoryRead.questions,
+    recall_gate: { instructions: 'edited', criteria: { none: 'EDITED', memory: 'EDITED-M' } } } };
+  const merged = mergeDeclarations(builtins, [edited]);
+  assert.equal(merged.filter(point => point.name === 'memory.read').length, 1, 'no duplicate name may survive');
+  assert.equal(merged.find(point => point.name === 'memory.read').questions.recall_gate.criteria.none, 'EDITED');
+  // The other built-ins are untouched.
+  assert.ok(merged.some(point => point.name === 'session.distill'));
+  // A genuinely new point is added rather than replacing anything.
+  const extra = { name: 'frontend.css', trigger: 'before-turn', automation: 'silent', stateFields: ['message'],
+    questions: { q: { instructions: 'i', criteria: { no: 'n', yes: 'y' } } }, actions: { q: { no: 'proceed', yes: 'proceed' } } };
+  const withExtra = mergeDeclarations(builtins, [extra]);
+  assert.equal(withExtra.length, builtins.length + 1);
+  assert.ok(withExtra.some(point => point.name === 'frontend.css'));
+});

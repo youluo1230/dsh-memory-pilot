@@ -144,6 +144,25 @@ export function normalizeDeclarations(value) {
   return [];
 }
 
+/**
+ * Merge user declarations over the built-ins.
+ *
+ * A declaration whose name matches a built-in REPLACES it. Appending instead left two
+ * points of the same name in the list, so every `find(point => name === ...)` returned
+ * the built-in: an edited criterion validated, appeared in the settings panel, and
+ * changed nothing at runtime — the precise drift this change set exists to remove.
+ *
+ * Exported as a pure function so the rule is testable without assembling a plugin.
+ */
+export function mergeDeclarations(builtins, declarations) {
+  const overrides = new Map((Array.isArray(declarations) ? declarations : [])
+    .filter(declaration => typeof declaration?.name === 'string')
+    .map(declaration => [declaration.name, declaration]));
+  const replaced = builtins.map(point => overrides.get(point.name) ?? point);
+  const added = [...overrides.values()].filter(declaration => !builtins.some(point => point.name === declaration.name));
+  return [...replaced, ...added];
+}
+
 export function apply(ctx, config) {
   debug('apply called');
   const current = () => resolveConfig(config);
@@ -154,10 +173,10 @@ export function apply(ctx, config) {
   // so a change here is a change to behaviour rather than to a display.
   const declaredPoints = () => {
     const off = new Set(Array.isArray(current().disabledPoints) ? current().disabledPoints.filter(name => typeof name === 'string') : []);
-    const points = loadDecisionPoints([
-      memoryRead, memoryWrite, commandSafety, sessionDistill,
-      ...(normalizeDeclarations(current().decisionPoints)),
-    ]);
+    const points = loadDecisionPoints(mergeDeclarations(
+      [memoryRead, memoryWrite, commandSafety, sessionDistill],
+      normalizeDeclarations(current().decisionPoints),
+    ));
     return points.filter(point => !off.has(point.name));
   };
   const pointEnabled = name => {
