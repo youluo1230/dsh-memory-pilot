@@ -436,12 +436,11 @@ export function apply(ctx, config) {
    */
   const runDistillation = async ({ session, turn, userText, assistantText, reason, runtime, thresholdFire, force = false }) => {
     if (disposed) return undefined;
-    if (!force && !thresholdFire) {
-      // Every turn still gets a gate question, but only once the threshold fires do
-      // we run the per-candidate selection. Below the threshold the turn is
-      // remembered by resident capture, not distilled.
-      // (The threshold is the only cheap way to bound cost per turn.)
-    }
+    // The threshold is what bounds cost per turn: below it a turn is left to turn
+    // capture, and only the accumulated transcript is distilled at archive time (or
+    // when the threshold fires). Running the two-level judgment on every turn would
+    // spend a gate request on every message to learn "nothing durable here".
+    if (!force && !thresholdFire) return undefined;
     const candidates = cutCandidates({ userText, assistantText, reason: reason?.kind });
     if (!candidates.length) return { gate: 'discarded', candidates: 0, retained: [], failed: [], durationMs: 0, reason: 'no-candidates', candidateTexts: [] };
     const snapshot = residentSnapshots.get(session);
@@ -514,7 +513,8 @@ export function apply(ctx, config) {
       if (snapshot?.writeRevisions && typeof saved?.revision === 'string') snapshot.writeRevisions[revisionKey] = saved.revision;
       return saved;
     } catch (error) {
-      // A full file degrades to the external store rather than losing the fact.
+      // A full file is reported to the caller, which degrades to the external store
+      // rather than losing the fact.
       throw error;
     }
   };
@@ -523,9 +523,12 @@ export function apply(ctx, config) {
     const runtime = runtimeFor(session);
     if (!runtime?.directRetain) return { accepted: 0 };
     const identity = identityFor(session);
+    // The distilled candidate IS the event: retention evidence must be the text being
+    // stored, so the fact travels as its own evidence rather than as a quote into
+    // some larger message.
     const event = { ...identity, sessionId: session.id, id: `distill:${Date.now()}`, type: 'turn_end', text: candidate.text };
-    try { await runtime.directRetain(event, { budgetMs: distillBudget() }); return { accepted: 1 }; }
-    catch (error) { throw error; }
+    await runtime.directRetain(event, { budgetMs: distillBudget() });
+    return { accepted: 1 };
   };
 
   const distillBudget = () => Number(current().distillBudgetMs) || 30000;
