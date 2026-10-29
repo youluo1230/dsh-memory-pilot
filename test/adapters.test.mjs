@@ -429,3 +429,102 @@ test('backend cancellation prevents pre-aborted calls and discards late response
   const backend = memos({ async searchMemory(_query, { signal }) { assert.equal(signal, late.signal); late.abort(); return { hits: [] }; } });
   await assert.rejects(backend.execute(action(), { signal: late.signal }), { name: 'AbortError' });
 });
+
+test('the recall judgment actually receives the resident digest its criteria defer to', async () => {
+  // The declaration names `residentDigest` because its criterion says "when resident
+  // memory does not already state it". For months the host supplied nothing, so the
+  // point judged a question about an always-absent field. Adding the name to the
+  // runtime allowlist made the load-time check pass but proved nothing; this asserts
+  // the VALUE reaches the request.
+  let state;
+  const decision = createSystemOneDecision({
+    baseUrl: 'https://example.invalid/v1', model: 'jev',
+    fetchImpl: async (_url, init) => {
+      state = JSON.parse(JSON.parse(init.body).state);
+      return reply({ answers: {
+        recall_gate: { type: 'choice', choice: 'none' },
+        retrieval_mode: { type: 'choice', choice: 'recall' },
+        scope_project: { type: 'choice', choice: 'skip' },
+      } });
+    },
+  });
+  await decision.decide({
+    event: { id: 'e1', type: 'message', text: 'what am I working on?', projectId: 'p',
+      residentMemory: { user: 'Prefers Chinese.', global: 'Uses pnpm.', project: '' } },
+    capabilities: [{ backend: 'h', scope: 'project', scopeId: 'p', operations: ['search'] }],
+  });
+  assert.ok(state.residentDigest, 'the digest must be present in the judged state');
+  assert.match(state.residentDigest, /Prefers Chinese/);
+  assert.match(state.residentDigest, /Uses pnpm/);
+  // It is a projection, not a copy of the files.
+  assert.equal(state.residentDigest.includes('memory-pilot:managed'), false);
+});
+
+test('no resident memory means no digest key at all, not an empty string', async () => {
+  let state;
+  const decision = createSystemOneDecision({
+    baseUrl: 'https://example.invalid/v1', model: 'jev',
+    fetchImpl: async (_url, init) => {
+      state = JSON.parse(JSON.parse(init.body).state);
+      return reply({ answers: {
+        recall_gate: { type: 'choice', choice: 'none' },
+        retrieval_mode: { type: 'choice', choice: 'recall' },
+        scope_project: { type: 'choice', choice: 'skip' },
+      } });
+    },
+  });
+  await decision.decide({ event: { id: 'e1', type: 'message', text: 'q', projectId: 'p' },
+    capabilities: [{ backend: 'h', scope: 'project', scopeId: 'p', operations: ['search'] }] });
+  assert.equal('residentDigest' in state, false);
+});
+
+test('an edited criterion reaches the request, which is what makes it editable at all', async () => {
+  // Story 3: "my edit really affects runtime behaviour, rather than being overridden
+  // by another copy in the code." The adapter must read the declaration it is given,
+  // live — a snapshot taken at construction would silently ignore every later edit.
+  const { memoryRead } = await import('../src/decision-points.mjs');
+  let live = memoryRead;
+  const sent = [];
+  const decision = createSystemOneDecision({
+    baseUrl: 'https://example.invalid/v1', model: 'jev',
+    points: () => ({ read: live }),
+    fetchImpl: async (_url, init) => {
+      const body = JSON.parse(init.body);
+      sent.push(body.questions.recall_gate.criteria.none);
+      return reply({ answers: {
+        recall_gate: { type: 'choice', choice: 'none' },
+        retrieval_mode: { type: 'choice', choice: 'recall' },
+        scope_project: { type: 'choice', choice: 'skip' },
+      } });
+    },
+  });
+  const input = { event: { id: 'e1', type: 'message', text: 'q', projectId: 'p' },
+    capabilities: [{ backend: 'h', scope: 'project', scopeId: 'p', operations: ['search'] }] };
+  await decision.decide(input);
+  live = { ...memoryRead, questions: { ...memoryRead.questions, recall_gate: { instructions: 'edited', criteria: { none: 'EDITED', memory: 'EDITED-MEMORY' } } } };
+  await decision.decide({ ...input, event: { ...input.event, id: 'e2' } });
+  assert.match(sent[0], /self-contained/);
+  assert.equal(sent[1], 'EDITED', 'the edit must travel without remounting the runtime');
+});
+
+test('a disabled memory point stops being asked, not merely hidden', async () => {
+  // Story 4: turning a point off must stop it ASKING. Asking and then ignoring the
+  // answer still spends tokens and can still act.
+  let asked = null;
+  const decision = createSystemOneDecision({
+    baseUrl: 'https://example.invalid/v1', model: 'jev',
+    // `write` absent means the point is disabled, and an absent side is authoritative
+    // rather than "fall back to the built-in".
+    points: () => ({ read: undefined, write: undefined }),
+    fetchImpl: async (_url, init) => {
+      asked = Object.keys(JSON.parse(init.body).questions);
+      return reply({ answers: {} });
+    },
+  });
+  const result = await decision.decide({
+    event: { id: 'e1', type: 'message', text: 'q', projectId: 'p' },
+    capabilities: [{ backend: 'h', scope: 'project', scopeId: 'p', operations: ['search', 'write'] }],
+  });
+  assert.deepEqual(result.actions, []);
+  assert.equal(asked, null, 'with no active point there is nothing to ask');
+});

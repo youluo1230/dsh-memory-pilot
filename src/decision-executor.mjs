@@ -71,12 +71,11 @@ export function questionStages(point) {
 /**
  * Ask one point, honouring intra-point question dependencies.
  *
- * `shouldContinue` lets the caller stop after a gate without the executor knowing
- * what the gate meant: distillation passes a predicate that stops when the coarse
- * turn-level answer was `discard`. The executor passes the answers forward and
- * stays ignorant of their meaning.
+ * A later group is asked only once its prerequisite actually answered, so a gate that
+ * returned nothing stops the chain. The executor still does not know what any answer
+ * MEANS — only that a question that was never answered cannot authorize the next.
  */
-export async function askPointStaged(point, { decision, state, facts, signal, timeoutMs = 15_000, shouldContinue }) {
+export async function askPointStaged(point, { decision, state, facts, signal, timeoutMs = 15_000 }) {
   const stages = questionStages(point);
   if (!stages.length) return undefined;
   const projected = stateFor(point, state);
@@ -84,13 +83,12 @@ export async function askPointStaged(point, { decision, state, facts, signal, ti
   const allVerbs = [];
   const answeredNames = [];
   let lastResponse;
+  let previousAnswered = false;
   for (const [index, names] of stages.entries()) {
-    // A dependent question is only asked once its prerequisite actually answered
-    // with a choice that authorizes asking it. `shouldContinue` carries that
-    // judgment for the caller; absent one, every stage is asked.
-    if (index > 0 && typeof shouldContinue === 'function') {
-      if (!shouldContinue({ answers: allAnswers, point })) break;
-    }
+    // A dependent question is only asked once the group before it produced an answer.
+    // That is all the executor may know: what the answer MEANS belongs to the caller's
+    // landing or to the declaration's action table.
+    if (index > 0 && !previousAnswered) break;
     const questions = {};
     for (const name of names) {
       const question = point.questions[name];
@@ -103,6 +101,7 @@ export async function askPointStaged(point, { decision, state, facts, signal, ti
       { signal: signal ?? AbortSignal.timeout(timeoutMs) },
     );
     lastResponse = response;
+    previousAnswered = false;
     for (const name of Object.keys(questions)) {
       const answer = response?.answers?.[name];
       if (!answer || typeof answer.choice !== 'string') continue;
@@ -111,6 +110,7 @@ export async function askPointStaged(point, { decision, state, facts, signal, ti
       if (Number.isFinite(answer.confidence)) entry.confidence = answer.confidence;
       allAnswers.push(entry);
       answeredNames.push(name);
+      previousAnswered = true;
       const verb = point.actions?.[name]?.[answer.choice];
       if (verb) allVerbs.push({ question: name, choice: answer.choice, verb });
     }

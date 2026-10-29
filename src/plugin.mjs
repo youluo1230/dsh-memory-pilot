@@ -6,12 +6,11 @@ import { acceptsWorkspacePath, bindingsForIdentity, detectIdentity, matchWorkspa
 import { createOpenAICompatibleDecision, createSystemOneDecision } from './adapters.mjs';
 import { createRegistry } from './registry.mjs';
 import { attachHost } from './host.mjs';
-import { BUILTIN_DECISION_POINTS, commandSafety, loadDecisionPoints, memoryRead, memoryWrite, sessionDistill } from './decision-points.mjs';
+import { commandSafety, loadDecisionPoints, memoryRead, memoryWrite, sessionDistill } from './decision-points.mjs';
 import { askPoint } from './decision-executor.mjs';
 import { createToolGuard, createMonotonicRefusal, callFamily } from './tool-guard.mjs';
-import { createDistillTrigger, cutCandidates, distillTurn } from './distillation.mjs';
-import { createActivityLog, summarizeActivity } from './activity.mjs';
-import { residentDigestOf } from './memory-landings.mjs';
+import { createDistillTrigger, cutCandidates, distillTurn, factKey, pickDistillTarget } from './distillation.mjs';
+import { createActivityLog } from './activity.mjs';
 import { resolveAutomationTier } from './decision-layer.mjs';
 import { installSettingsRpc } from './settings-rpc.mjs';
 import { testDecisionConnection, testSystemConnection } from './connection-test.mjs';
@@ -81,9 +80,22 @@ export const Config = Schema.object({
   // The author's default for the safety point, and the ceiling on how autonomous a
   // user may make it. A user can tighten (`silent-visible`/`ask`); the resolver
   // clamps anything looser back to the author's tier.
+  // The effective tier for tool safety. Shipped at `ask`: interruption on a
+  // destructive call is the safer default, and a user who finds it noisy tightens
+  // toward `silent-visible`. `resolveAutomationTier` takes the stricter of this and
+  // the declaration's, so neither side can loosen the other past the author's floor.
   safetyTier: Schema.union(['silent', 'silent-visible', 'ask']).default('ask'),
+  // Which severities are worth interrupting for, lowest to highest. The default asks
+  // about destructive and out-of-scope work; a user who considers `unknown` risky
+  // adds it, and one who trusts reversible work can narrow the list.
+  safetyAskSeverities: Schema.array(Schema.union(['reversible', 'destructive', 'unknown', 'out-of-scope']))
+    .default(['destructive', 'out-of-scope']),
   // Whether a severity the tier decided not to ask about still leaves a record.
   safetyRecordUnasked: Schema.boolean().default(true),
+  // Which decision points are active. Turning one off must stop it ASKING, not just
+  // hide a row — a disabled point that still questions the model spends tokens and can
+  // still act, which is the failure this switch exists to exclude.
+  disabledPoints: Schema.array(Schema.string()).default([]),
   // User-declared decision points. Validated with the same rules as the built-in
   // ones, so a broken declaration fails at load instead of judging nonsense.
   decisionPoints: Schema.any().default([]),
@@ -140,10 +152,18 @@ export function apply(ctx, config) {
   const activity = createActivityLog({ limit: 50 });
   // The declarations the settings panel may edit. The runtime reads these objects,
   // so a change here is a change to behaviour rather than to a display.
-  const declaredPoints = () => loadDecisionPoints([
-    memoryRead, memoryWrite, commandSafety, sessionDistill,
-    ...(normalizeDeclarations(current().decisionPoints)),
-  ]);
+  const declaredPoints = () => {
+    const off = new Set(Array.isArray(current().disabledPoints) ? current().disabledPoints.filter(name => typeof name === 'string') : []);
+    const points = loadDecisionPoints([
+      memoryRead, memoryWrite, commandSafety, sessionDistill,
+      ...(normalizeDeclarations(current().decisionPoints)),
+    ]);
+    return points.filter(point => !off.has(point.name));
+  };
+  const pointEnabled = name => {
+    const off = current().disabledPoints;
+    return !(Array.isArray(off) && off.includes(name));
+  };
   const residentMemory = createResidentMemory();
   const residentSnapshots = new WeakMap();
   const residentLoads = new WeakMap();
@@ -259,8 +279,22 @@ export function apply(ctx, config) {
     const registry = bindings.length ? createRegistry({ bindings, identities: { personal: identity.actorId, project: identity.projectId, workspace: identity.workspaceId } }) : null;
     const createDecision = resolved.decisionProtocol === 'openai' ? createOpenAICompatibleDecision : createSystemOneDecision;
     const apiKey = resolveApiKey({ keyEnv: resolved.decisionKeyEnv, apiKey: resolved.decisionApiKey }).value;
+    // The declarations, read live. This is the wiring whose absence made the whole
+    // premise false: the adapter used to build its questionnaire from private
+    // literals, so editing `memory.write`'s criteria in settings changed nothing at
+    // runtime. Passing the declarations here is what makes them the only source —
+    // `memoryPointsFor` re-reads them per call, so an edit takes effect immediately.
+    const memoryPointsFor = () => {
+      const all = declaredPoints();
+      // A disabled point is absent from the map entirely, so the questionnaire drops
+      // its questions rather than asking them and ignoring the answer.
+      return {
+        read: all.find(point => point.name === 'memory.read'),
+        write: all.find(point => point.name === 'memory.write'),
+      };
+    };
     const decision = usesDecision
-      ? createDecision({ baseUrl: resolved.decisionBaseUrl, model: resolved.decisionModel, apiKey })
+      ? createDecision({ baseUrl: resolved.decisionBaseUrl, model: resolved.decisionModel, apiKey, points: memoryPointsFor })
       : null;
     const orchestrator = registry && decision ? createOrchestrator({
       decision, backends: registry.backends, policy: registry.policy, budgetMs: resolved.budgetMs,
@@ -461,11 +495,14 @@ export function apply(ctx, config) {
           }
           return answers;
         },
-        retain: async ({ candidate, key, forceExternal }) => {
+        retain: async ({ candidate, forceExternal }) => {
+          // The target is chosen first because the key is derived per target: the same
+          // fact in a different store is a different row, while a correction in the
+          // same store must collide with the fact it replaces.
           const target = forceExternal ? 'external'
-            : pickDistillTarget({ candidate, resident: snapshot?.resident ?? {} });
+            : pickDistillTarget({ candidate, identity: identityFor(session) });
           if (target === 'external') return { target: 'external', status: 'ok', ...(await retainExternal(session, candidate)) };
-          const saved = await retainResident({ session, target, key: key ?? undefined, content: candidate.text });
+          const saved = await retainResident({ session, target, key: factKey({ scope: target, text: candidate.text, explicit: candidate.key }), content: candidate.text });
           return { target, status: saved?.degraded ? 'degraded' : 'ok' };
         },
       });
@@ -488,21 +525,16 @@ export function apply(ctx, config) {
     }
   };
 
-  /** Where a distilled candidate belongs. The project is the specific answer for a
-   * repository fact, global memory for a cross-project preference; without any
-   * resident room the external store keeps the detail retrievable. */
-  const pickDistillTarget = ({ candidate, resident }) => {
-    const text = candidate.text ?? '';
-    // A fact naming this repository, or the assistant summarising work done here,
-    // belongs to the project. Otherwise it is about the user across projects.
-    if (resident.project !== undefined || identityFor({ header: { cwd: '' } }).projectId) {
-      // Prefer the project when the candidate mentions a path or the word project.
-      if (/\b(project|repo(sitory)?|这(个)?(项目|仓库)|代码库)\b/i.test(text)) return 'project-memory';
-    }
-    if (resident.user !== undefined) return 'user';
-    return 'global-memory';
-  };
-
+  /**
+   * Where a distilled candidate belongs.
+   *
+   * The target names are resident-memory targets (`RESIDENT_TARGETS`), not the
+   * memory-scope vocabulary: distillation writes into the always-visible files, and
+   * `external` is the fallback when they are full. Choosing between them uses only
+   * the identity this session actually has — an earlier version built a fake session
+   * with an empty cwd just to ask whether a project existed, which answered "no" for
+   * every session and silently sent every repository fact to global memory.
+   */
   const retainResident = async ({ session, target, key, content }) => {
     const identity = identityFor(session);
     const snapshot = residentSnapshots.get(session);
@@ -543,7 +575,7 @@ export function apply(ctx, config) {
   const traceSink = { current: () => {} };
   const guardFor = session => {
     const runtime = runtimeFor(session);
-    if (!runtime?.decision) return undefined;
+    if (!runtime?.decision || !pointEnabled('command.safety')) return undefined;
     return createToolGuard({
       judge: async ({ toolName, args, exec }) => {
         // The declared command.safety point judges the call. It reports severity;
@@ -577,6 +609,12 @@ export function apply(ctx, config) {
         // Author tier is the ceiling: a user may only tighten it.
         try { return resolveAutomationTier({ authorTier: commandSafety.automation, userTier: current().safetyTier ?? commandSafety.automation }); }
         catch { return commandSafety.automation; }
+      },
+      // The configured severity threshold, re-read per call so a change takes effect
+      // without remounting.
+      askFrom: () => {
+        const configured = current().safetyAskSeverities;
+        return Array.isArray(configured) && configured.length ? configured : ['destructive', 'out-of-scope'];
       },
       record: row => {
         if (current().safetyRecordUnasked === false && row.status === 'allowed') return;
@@ -681,13 +719,17 @@ export function apply(ctx, config) {
     // the plugin cut. It runs after the answer, so nothing here can slow a turn.
     distill: ({ session, turn, userText, assistantText, reason }) => {
       const resolved = prepared();
-      if (resolved.distillEnabled === false) return undefined;
+      if (resolved.distillEnabled === false || !pointEnabled('session.distill')) return undefined;
       const runtime = runtimeFor(session);
       if (!runtime?.decision) return undefined;
       // The threshold fallback exists because most conversations are never
       // archived. Without it, closing the browser loses everything since the last
-      // explicit end-of-session signal.
-      const thresholdFire = distillTrigger.countTurn(session.id, { durable: reason?.kind !== 'aborted' });
+      // explicit end-of-session signal. Only a turn that produced an answer is
+      // durable: an aborted or errored turn has nothing to select from, and counting
+      // it would let half-answers fill the threshold.
+      const kind = typeof reason === 'string' ? reason : reason?.kind;
+      const durable = kind !== 'aborted' && kind !== 'error';
+      const thresholdFire = distillTrigger.countTurn(session.id, { durable });
       return runDistillation({ session, turn, userText, assistantText, reason, runtime, thresholdFire });
     },
     capturesTurn: () => current().distillEnabled !== false,
@@ -777,10 +819,18 @@ export function apply(ctx, config) {
       const guard = guardFor(session);
       if (!guard) return next();
       const decision = await guard.gate(exec);
-      // A refusal is remembered so the monotonic guard can hold it: a downstream
-      // listener returning `allow` must not be able to undo our denial.
-      if (decision.kind === 'deny') safetyDenied.add(callFamilyOf(exec));
-      return decision.kind === 'allow' ? next() : decision;
+      if (decision.kind === 'allow') return next();
+      // A refusal is pinned so a downstream listener cannot turn it back into
+      // permission — but a guard pin is permanent, and pinning every refusal would
+      // make a family the user rejected once unaskable forever. So the pin is keyed
+      // by the exact CALL, and lifted once the registry has consumed it: the pin only
+      // has to survive until the guard chain runs for this one call.
+      const callId = String(exec?.callId ?? callFamilyOf(exec));
+      safetyDenied.add(callId);
+      // `queueMicrotask` is enough: the registry resolves guards synchronously after
+      // the waterfall settles, before the tool body runs.
+      queueMicrotask(() => safetyDenied.delete(callId));
+      return decision;
     } catch {
       // A gate that throws must not fail the tool call; the registry's own default
       // applies. The failure is still visible through the activity list.
@@ -797,7 +847,7 @@ export function apply(ctx, config) {
         // refusal back into permission.
         const tools = service('tools');
         if (!tools || typeof tools.guard !== 'function') return () => {};
-        return tools.guard(createMonotonicRefusal(safetyDenied));
+        return tools.guard(createMonotonicRefusal(safetyDenied, exec => String(exec?.callId ?? callFamily(exec?.name, exec?.arguments))));
       })
     : () => {};
 

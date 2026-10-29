@@ -1,8 +1,11 @@
 // Adapters perform no bootstrap, logging, or IO at construction.
 import { createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
-import { memoryRead, memoryWrite, readScopeQuestions, writeScopeQuestions } from './decision-points.mjs';
+import { RETENTION_QUESTION, memoryRead, memoryWrite, readScopeQuestions, writeScopeQuestions } from './decision-points.mjs';
+import { residentDigestOf } from './memory-landings.mjs';
 const SCOPES = new Set(['personal', 'global', 'project', 'workspace']);
+/** A declaration's question in the wire shape the transport expects. */
+const toQuestion = question => ({ type: 'choice', instructions: question.instructions, criteria: question.criteria });
 const OPERATIONS = new Set(['search', 'deep', 'write']);
 
 // The preambles the judgment model reads alongside the declared criteria. These are
@@ -161,8 +164,16 @@ export function createOpenAICompatibleDecision({ baseUrl, model, apiKey, fetchIm
  * questionnaire that would judge nothing.
  */
 export function resolveMemoryPoints(points) {
-  if (points && (points.read || points.write)) {
-    return { read: points.read ?? memoryRead, write: points.write ?? memoryWrite };
+  // A function is read on every call, which is what makes an edited criterion take
+  // effect without remounting the runtime. The settings panel edits declarations
+  // live, so a snapshot taken at construction would silently ignore every edit.
+  //
+  // A MAP THAT WAS SUPPLIED is authoritative even when one side is absent: a caller
+  // that resolved `read` to nothing did so because the point is disabled, and falling
+  // back to the built-in there would quietly re-enable it.
+  if (points !== undefined) {
+    const current = typeof points === 'function' ? points() : points;
+    if (current && typeof current === 'object') return { read: current.read, write: current.write };
   }
   return { read: memoryRead, write: memoryWrite };
 }
@@ -261,7 +272,10 @@ export function createSystemOneDecision({ baseUrl, model, apiKey, fetchImpl = gl
       const criteria = { none: 'Do not retain this event.' };
       for (const target of targets) criteria[target] = ({ user: 'Stable cross-project user identity, preference, communication style, or working habit.', 'global-memory': 'Small cross-project fact that must remain visible in every session.', 'project-memory': 'Small durable fact, decision, constraint, or milestone for this repository.', external: 'Detailed history or experience for an external memory backend.' })[target];
       const questions = {
-        retention_gate: { type: 'choice', instructions: 'Retain only explicit, stable, useful, non-sensitive facts directly evidenced by this event.', criteria: { discard: 'Discard ephemeral, duplicated, speculative, sensitive, or operational content.', retain: 'Retain a stable preference, verified fact, decision, constraint, reusable result, or milestone.' } },
+        // The declaration's criterion, not a fourth paraphrase of it. Its wording is
+        // measured and names the shapes that count, so the retention-only path and the
+        // message path judge by the same words.
+        retention_gate: toQuestion(RETENTION_QUESTION),
         resident_target: { type: 'choice', instructions: 'If retention is justified, choose exactly one authorized destination. Resident files are small always-visible memory; external memory is for detailed history.', criteria },
       };
       const controller = new AbortController(); const abort = () => controller.abort(); signal?.addEventListener('abort', abort, { once: true }); const timer = setTimeout(abort, timeoutMs);
@@ -306,6 +320,7 @@ export function createSystemOneDecision({ baseUrl, model, apiKey, fetchImpl = gl
           repository: event.projectId ? { id: event.projectId, path: event.projectPath } : undefined,
         };
         const decisionContext = event.type === 'message' ? retrievalContext : retentionContext;
+        const digest = residentDigestOf(event.residentMemory);
         const response = await post(fetchImpl, url, apiKey, {
           model, state: JSON.stringify({
             decisionContext, event, environment, capabilities: input.capabilities,
@@ -313,6 +328,13 @@ export function createSystemOneDecision({ baseUrl, model, apiKey, fetchImpl = gl
             // resident memory already states. Supplying it is the whole reason the
             // declaration is honest; it is a coverage signal, never instructions.
             ...(event.residentMemory ? { residentMemory: event.residentMemory } : {}),
+            // The field `memory.read` declares. Its recall criterion explicitly defers
+            // to what resident memory already states — "when resident memory does not
+            // already state it" — so without this projection the point was judging a
+            // question about a field that was always absent. Sent as the bounded digest
+            // rather than the raw files so it informs the criteria instead of
+            // diluting them, which is what the judged-state cap exists to prevent.
+            ...(digest ? { residentDigest: digest.text } : {}),
           }), questions,
         }, controller.signal);
         // The answers must cover exactly the questions asked. A response missing a

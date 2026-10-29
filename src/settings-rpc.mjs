@@ -9,6 +9,13 @@ const ALLOWED_FIELDS = new Set([
   'enabled', 'decisionEnabled', 'workspacePath', 'projectId', 'actorId', 'workspaceId',
   'decisionBaseUrl', 'decisionModel', 'decisionProtocol', 'decisionKeyEnv', 'decisionApiKey', 'budgetMs',
   'captureBudgetMs', 'backends', 'scopeOverrides',
+  // Editable criteria and the switches that govern them. These are writable from the
+  // panel because the criteria are the entire source of accuracy — a user who knows
+  // what "worth remembering" means in their own work must be able to say so without
+  // waiting for a release.
+  'decisionPoints', 'disabledPoints',
+  'safetyEnabled', 'safetyTier', 'safetyAskSeverities', 'safetyRecordUnasked',
+  'distillEnabled', 'distillTurnThreshold', 'distillBudgetMs',
 ]);
 
 function fail(code, message) {

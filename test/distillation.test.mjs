@@ -5,7 +5,7 @@
 // failure does not throw away what already landed.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cutCandidates, distillTurn, factKey, residentKeys, isResidentFull, createDistillTrigger, MAX_CANDIDATES } from '../src/distillation.mjs';
+import { cutCandidates, distillTurn, factKey, residentKeys, isResidentFull, createDistillTrigger, pickDistillTarget, MAX_CANDIDATES } from '../src/distillation.mjs';
 
 const turn = { userText: '以后这个项目都用 pnpm，不要用 npm。', assistantText: '明白了，这个仓库统一用 pnpm。' };
 
@@ -186,4 +186,17 @@ test('a threshold of zero makes archiving the only trigger', () => {
 test('a disabled distillation never fires', () => {
   const trigger = createDistillTrigger({ threshold: 1, enabled: () => false });
   assert.equal(trigger.countTurn('s'), false);
+});
+
+test('a distilled fact goes to the project file only when this session has a project', () => {
+  // The bug this guards: the target was chosen by building a fake session with an
+  // empty cwd and asking whether a project existed — which answered "no" for every
+  // session, so every repository fact silently went to global memory.
+  const withProject = { projectId: 'repo', projectPath: '/work/repo' };
+  assert.equal(pickDistillTarget({ candidate: { text: '这个项目用 pnpm' }, identity: withProject }), 'project-memory');
+  assert.equal(pickDistillTarget({ candidate: { text: '这个仓库的 CI 在 GitHub' }, identity: withProject }), 'project-memory');
+  assert.equal(pickDistillTarget({ candidate: { text: '我更喜欢中文' }, identity: withProject }), 'global-memory');
+  // Without a project the fact cannot belong to one.
+  assert.equal(pickDistillTarget({ candidate: { text: '这个项目用 pnpm' }, identity: {} }), 'user');
+  assert.equal(pickDistillTarget({ candidate: { text: 'x' }, identity: undefined }), 'user');
 });

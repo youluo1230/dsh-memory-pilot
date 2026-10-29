@@ -153,7 +153,10 @@ const memoryWrite = {
 const commandSafety = {
   name: 'command.safety',
   trigger: 'before-tool-call',
-  automation: 'ask',
+  // The author's default tier. `silent-visible` lets a destructive call proceed but
+  // leaves a record, which is the least intrusive setting that is still honest about
+  // what happened. A user may tighten it to `ask`; the shipped default does.
+  automation: 'silent-visible',
   stateFields: ['context'],
   questions: {
     severity: {
@@ -257,9 +260,5 @@ export function questionsFor(point, { facts = {} } = {}) {
 export function stateFor(point, raw) {
   return judgeState(raw, { fields: point.stateFields ?? ['message'] });
 }
-
-/** Every declared point matching one trigger. Points are selected by trigger, so a
- * new point of an existing trigger needs no wiring in the plugin. */
-export const pointsForTrigger = (trigger, points = BUILTIN_DECISION_POINTS) => points.filter(point => point.trigger === trigger);
 
 export { memoryRead, memoryWrite, commandSafety, sessionDistill, resolveAutomationTier };

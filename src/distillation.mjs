@@ -23,6 +23,12 @@
  * converge instead of duplicating: the key comes from the fact, not the source.
  */
 import { createHash } from 'node:crypto';
+import { sessionDistill } from './decision-points.mjs';
+import { residentDigestOf } from './memory-landings.mjs';
+import { questionStages } from './decision-executor.mjs';
+
+/** A declaration's question in the wire shape the transport expects. */
+const toQuestion = question => ({ type: 'choice', instructions: question.instructions, criteria: question.criteria });
 
 /** Upper bound on candidates presented to one judgment.
  *
@@ -124,6 +130,28 @@ export function residentKeys(resident) {
   return [...keys];
 }
 
+/**
+ * Where a distilled candidate belongs.
+ *
+ * The targets are resident-memory targets (`RESIDENT_TARGETS`), not memory scopes:
+ * distillation writes into the always-visible files, and `external` is the fallback
+ * when they are full. The choice uses only the identity the session actually has — an
+ * earlier version asked a fabricated session with an empty cwd whether a project
+ * existed, which answered "no" for every session and sent every repository fact to
+ * global memory.
+ */
+export function pickDistillTarget({ candidate, identity }) {
+  const text = candidate?.text ?? '';
+  const hasProject = Boolean(identity?.projectId || identity?.projectPath);
+  if (!hasProject) return 'user';
+  // A fact about this repository belongs to the project file; anything else is about
+  // the user across projects.
+  // `\b` is a word boundary for ASCII only, so `\b项目\b` never matches Chinese —
+  // every CJK repository fact fell through to global memory. Match the Latin words on
+  // a boundary and the CJK words without one.
+  return /\b(?:project|repo(?:sitory)?)\b|这(?:个)?(?:项目|仓库)|代码库/i.test(text) ? 'project-memory' : 'global-memory';
+}
+
 /** Whether an error means the resident file is full, which must degrade to the
  * external store rather than lose the fact. */
 export const isResidentFull = error => /exceeds limit/i.test(error instanceof Error ? error.message : String(error ?? ''));
@@ -138,14 +166,24 @@ export const isResidentFull = error => /exceeds limit/i.test(error instanceof Er
  */
 export async function distillTurn({
   turn, decideBatch, candidates, resident = {}, retain, now = () => Date.now(), maxCandidates = MAX_CANDIDATES,
+  point = sessionDistill,
 }) {
   const startedAt = now();
   const cut = candidates ?? cutCandidates(turn);
   const report = { startedAt, candidates: cut.length, retained: [], failed: [], gate: 'discarded', durationMs: 0 };
   if (!cut.length) { report.durationMs = now() - startedAt; report.reason = 'no-candidates'; return report; }
 
+  // The two levels come from the DECLARATION's own structure: `questionStages` returns
+  // the gate first and the candidate selection second, because that is what
+  // `questionDepends` says. Deriving the split here rather than hard-coding two blocks
+  // is what keeps the declaration authoritative when a user re-orders or edits it.
+  const stages = questionStages(point);
+  const gateNames = stages[0] ?? [];
+  const hasSecondLevel = stages.length > 1;
   const keys = residentKeys(resident);
-  const residentDigest = digestFor(resident);
+  // One projection of resident memory, shared with the memory path — a second copy
+  // here is how two views of "what is already stored" start disagreeing.
+  const residentDigest = residentDigestOf(resident)?.text;
   // Two levels, and the first is one question about the whole turn. It exists to
   // stop most turns here: judging every candidate on a turn that said nothing
   // durable spends the budget to learn nothing.
@@ -156,16 +194,10 @@ export async function distillTurn({
         candidates: cut.map(candidate => candidate.text),
         ...(residentDigest ? { residentDigest } : {}),
       },
-      questions: {
-        turn_worth_keeping: {
-          type: 'choice',
-          instructions: 'Decide whether this finished turn produced anything a future session would be wrong without. Judge the turn as a whole; it is fine to discard most turns.',
-          criteria: {
-            discard: 'Nothing durable here: greetings, acknowledgements, status reports, this-run plans and progress, raw tool or log output, unanswered questions, restated context, chit-chat. A turn that only ran commands and reported them has nothing to keep.',
-            keep: 'This turn produced something durable: a stated preference or standing instruction, a decision with its reason, a correction of a wrong belief, a project fact or constraint, a verified outcome, or a conclusion the discussion reached. Judge by whether losing it would cost a future session real work.',
-          },
-        },
-      },
+      // The gate question comes from the DECLARATION. Restating its criteria here
+      // would recreate the exact bug this work exists to remove — three drifted
+      // copies of one judgment, with no way to know which one is in effect.
+      questions: Object.fromEntries(gateNames.map(name => [name, toQuestion(point.questions[name])])),
     });
   } catch (error) {
     report.durationMs = now() - startedAt;
@@ -177,7 +209,11 @@ export async function distillTurn({
   // string too, because a caller wiring this to a transport may reasonably drop the
   // envelope once it has validated the choice.
   const gateChoice = name => typeof gate?.[name] === 'string' ? gate[name] : gate?.[name]?.choice;
-  if (gateChoice('turn_worth_keeping') !== 'keep') {
+  const gateAnswer = gateChoice(gateNames[0]);
+  // `store` is what the declaration says this answer authorizes; anything else means
+  // the turn is not worth the second level. Read the verb rather than hard-coding the
+  // option name, so a user's edited declaration governs the branch.
+  if (!hasSecondLevel || point.actions?.[gateNames[0]]?.[gateAnswer] !== 'store') {
     // Discarding is the common and correct answer, not a failure: report the
     // duration so a reader can see the gate is cheap when it says no.
     report.durationMs = now() - startedAt;
@@ -188,15 +224,15 @@ export async function distillTurn({
   // Second level: every candidate in ONE request. Measured cost of several
   // questions about one subject is nearly flat, so per-candidate round trips would
   // pay the latency several times over for the same answers.
+  // Per-candidate questions reuse the declaration's `candidate_selection` criteria
+  // verbatim; only the instruction names which candidate this instance is about.
+  const selectionQuestion = point.questions.candidate_selection;
   const questions = {};
   for (const candidate of cut) {
     questions[`candidate_${candidate.id}`] = {
       type: 'choice',
-      instructions: `Candidate ${candidate.id}: decide retain or discard. Candidates were cut from the turn by the plugin; judge only those given.`,
-      criteria: {
-        discard: 'Conversational filler, restated context, a proposal nobody agreed to, or a detail only meaningful inside this run.',
-        retain: 'States something durable and self-contained: still true, and still useful, in a new session that never saw this one.',
-      },
+      instructions: `${selectionQuestion.instructions} This question is about candidate ${candidate.id}.`,
+      criteria: selectionQuestion.criteria,
     };
   }
   let selection;
@@ -223,7 +259,10 @@ export async function distillTurn({
   for (const candidate of chosen) {
     const evidence = { eventId: `distill:${candidate.id}`, quote: candidate.text };
     try {
-      const saved = await retain({ candidate, key: factKey({ scope: 'x', text: candidate.text, explicit: candidate.key }), evidence, resident });
+      // The key is derived for the target the fact will land in, so the same fact
+      // distilled into a different store is a different row — and a corrected fact in
+      // the SAME store collides, which is what makes a correction replace.
+      const saved = await retain({ candidate, evidence, resident });
       report.retained.push({ id: candidate.id, target: saved?.target, degraded: saved?.status === 'degraded' });
     } catch (error) {
       // One failed candidate must not discard the ones already written.
@@ -232,7 +271,7 @@ export async function distillTurn({
       // external store is what keeps the fact instead of losing it.
       if (isResidentFull(error)) {
         try {
-          const saved = await retain({ candidate, key: factKey({ scope: 'x', text: candidate.text }), evidence, resident, forceExternal: true });
+          const saved = await retain({ candidate, evidence, resident, forceExternal: true });
           report.retained.push({ id: candidate.id, target: saved?.target, degraded: true });
           report.failed.pop();
         } catch (fallbackError) {
@@ -243,19 +282,6 @@ export async function distillTurn({
   }
   report.durationMs = now() - startedAt;
   return report;
-}
-
-/** A bounded projection of resident memory for the distillation criteria. */
-function digestFor(resident) {
-  const parts = [];
-  for (const [scope, label] of [['user', 'user'], ['global', 'global-memory'], ['project', 'project-memory']]) {
-    const value = resident?.[scope];
-    if (typeof value !== 'string' || !value.trim()) continue;
-    const body = value.replace(/<!--\s*memory-pilot:managed:(?:start|end)\s*-->/g, '')
-      .replace(/<!--\s*id:\s*[^>]*?-->/g, '').replace(/\s+/g, ' ').trim();
-    if (body) parts.push(`[${label}] ${body}`);
-  }
-  return parts.length ? parts.join('\n') : undefined;
 }
 
 function reasonOf(error) {

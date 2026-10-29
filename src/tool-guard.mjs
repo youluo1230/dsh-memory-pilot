@@ -1,3 +1,4 @@
+import { ASK_SEVERITIES } from './decision-layer.mjs';
 /**
  * Tool safety at the per-call extension point.
  *
@@ -66,7 +67,7 @@ export function callFamily(toolName, args) {
  * `tier` resolves the effective automation tier for the safety point; it may only
  * move toward asking, which `resolveAutomationTier` already enforces.
  */
-export function createToolGuard({ judge, approve, tier = () => 'ask', record = () => {}, approveTimeoutMs = 120_000, now = () => Date.now() } = {}) {
+export function createToolGuard({ judge, approve, tier = () => 'ask', askFrom = askSeverities, record = () => {}, now = () => Date.now() } = {}) {
   if (typeof judge !== 'function') throw new TypeError('createToolGuard needs a judge function');
   // Fingerprints this session already authorized. A denial is never recorded here:
   // the guard grants nothing, so a refused call must be able to be refused again.
@@ -111,7 +112,11 @@ export function createToolGuard({ judge, approve, tier = () => 'ask', record = (
       return decide(severity, family, { verdict });
 
       function decide(severity, family, { verdict, indeterminate = false } = {}) {
-        const asks = ASK_FOR.has(severity);
+        // Which severities warrant an ask is a policy input, not a constant: the
+        // spec asks for a configurable severity threshold, and a user who considers
+        // `unknown` dangerous must be able to say so.
+        const ask = new Set(typeof askFrom === 'function' ? askFrom() : askFrom);
+        const asks = ask.has(severity);
         const effective = tier();
         // Already authorized once in this session: do not interrupt the same kind
         // of work again. This is the monotonic guard's real job.
@@ -143,10 +148,12 @@ export function createToolGuard({ judge, approve, tier = () => 'ask', record = (
      * themselves), and it enforces the same fail-closed rule.
      */
     async gate(exec, next) {
+      const gatedAt = now();
+      const elapsed = () => now() - gatedAt;
       const decision = await this.intercept(exec, async () => ({ kind: 'allow' }), next);
       if (decision.kind !== 'ask') return decision;
       if (typeof approve !== 'function') {
-        bump({ kind: 'tool-safety', tool: String(exec?.name ?? 'unknown'), status: 'denied', reason: 'no-approval', durationMs: 0 });
+        bump({ kind: 'tool-safety', tool: String(exec?.name ?? 'unknown'), status: 'denied', reason: 'no-approval', durationMs: elapsed() });
         return { kind: 'deny', reason: 'No approval service is available, so this call was refused.' };
       }
       const family = callFamily(exec?.name, exec?.arguments);
@@ -155,23 +162,25 @@ export function createToolGuard({ judge, approve, tier = () => 'ask', record = (
         outcome = await approve({ toolName: String(exec?.name ?? 'unknown'), callId: exec?.callId, reason: decision.reason, signal: exec?.signal });
       } catch {
         // An approval that cannot be obtained is a refusal, not a pass.
-        bump({ kind: 'tool-safety', tool: String(exec?.name ?? 'unknown'), status: 'denied', reason: 'approval-failed', durationMs: 0 });
+        bump({ kind: 'tool-safety', tool: String(exec?.name ?? 'unknown'), status: 'denied', reason: 'approval-failed', durationMs: elapsed() });
         return { kind: 'deny', reason: 'The approval request could not be completed.' };
       }
       if (outcome === GRANT) {
         // Record the grant so this family is not asked again in this session.
         granted.add(family);
-        bump({ kind: 'tool-safety', tool: String(exec?.name ?? 'unknown'), status: 'approved', durationMs: 0 });
+        bump({ kind: 'tool-safety', tool: String(exec?.name ?? 'unknown'), status: 'approved', durationMs: elapsed() });
         return { kind: 'allow' };
       }
-      bump({ kind: 'tool-safety', tool: String(exec?.name ?? 'unknown'), status: 'denied', reason: String(outcome ?? 'unavailable'), durationMs: 0 });
+      bump({ kind: 'tool-safety', tool: String(exec?.name ?? 'unknown'), status: 'denied', reason: String(outcome ?? 'unavailable'), durationMs: elapsed() });
       return { kind: 'deny', reason: outcome === 'rejected' ? 'The user rejected this call.' : 'The call was not approved.' };
     },
   });
 }
 
-/** Severities whose wrongness is visible enough to warrant asking. */
-const ASK_FOR = new Set(['destructive', 'out-of-scope']);
+/** The default set of severities that warrant asking: the ones whose wrongness is
+ * visible and hard to undo. `unknown` is deliberately absent — not knowing something
+ * is dangerous is not knowing it is. */
+export const askSeverities = () => ASK_SEVERITIES;
 
 const reasonFor = (severity, tool) => severity === 'out-of-scope'
   ? `${tool} reaches outside this task or workspace.`
@@ -196,14 +205,11 @@ const displayFor = (severity, tool) => severity === 'out-of-scope'
  *
  * Returns the deny reason, or `undefined` to leave the call as it was.
  */
-export function createMonotonicRefusal(denied) {
-  if (!(denied instanceof Set)) throw new TypeError('createMonotonicRefusal needs a Set of denied families');
+export function createMonotonicRefusal(denied, keyOf) {
+  if (!(denied instanceof Set)) throw new TypeError('createMonotonicRefusal needs a Set of denied calls');
+  const key = typeof keyOf === 'function' ? keyOf : execution => callFamily(execution?.name, execution?.arguments);
   return function refusal(execution) {
-    const family = callFamily(execution?.name, execution?.arguments);
-    return denied.has(family) ? `Refused by MemoryPilot tool safety (${execution?.name ?? 'call'}).` : undefined;
+    const id = key(execution);
+    return denied.has(id) ? `Refused by MemoryPilot tool safety (${execution?.name ?? 'call'}).` : undefined;
   };
 }
-
-/** Extract the severity a decision result authorized, for callers that want the
- * vocabulary without knowing the verb table. */
-export const severityOf = (veto) => typeof veto === 'string' ? veto : undefined;
